@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal.h
  *  Module : Hardware Abstraction Layer interface — all platform I/O declarations
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -105,32 +105,42 @@ uint8_t hal_keyboard_scan(uint8_t column);
 // Tick deferred key releases (call once per frame)
 void hal_keyboard_tick(void);
 
+// Process touch input and feed OSK events into matrix (call once per frame)
+void hal_keyboard_update_touch(void);
+
+// Returns true while the on-screen keyboard is visible (sprite push suppressed)
+bool hal_keyboard_osk_visible(void);
+
+// Draw the hotzone indicator buttons (F1/F2/F5/KB) in the TFT border
+void hal_keyboard_draw_overlay(void);
+
+// Force the next hal_keyboard_draw_overlay() call to repaint the hotzone buttons
+void hal_keyboard_invalidate_hotzone(void);
+
+// Read raw XPT2046 ADC values (used by touch calibration routine)
+bool hal_keyboard_read_raw_xy(uint16_t* out_x, uint16_t* out_y);
+
+// Override touch calibration constants at runtime (persisted via NVS)
+void hal_keyboard_set_touch_cal(uint16_t x_min, uint16_t x_max,
+                                 uint16_t y_min, uint16_t y_max);
+
 // ============================================================
 // Joystick subsystem
 // ============================================================
 
-// Initialize joystick input
-void hal_joystick_init(void);
-
-// Read joystick axis value
-//   port: 0 or 1
-//   Returns: 6-bit DAC value (0-63) representing position
+#if JOYSTICK_ENABLED
+void    hal_joystick_init(void);
 uint8_t hal_joystick_read_axis(int port, int axis);
-
-// Read joystick button state
-//   port: 0 or 1
-//   Returns: 1 if pressed, 0 if not
 uint8_t hal_joystick_read_button(int port);
-
-// DAC comparator for PIA0 PA7 (matches XRoar's joystick_update)
-//   port: 0=right, 1=left (from PIA0 CRB bit 3)
-//   axis: 0=X, 1=Y (from PIA0 CRA bit 3)
-//   dac_value: 6-bit threshold (from PIA1 DA bits 2-7)
-//   Returns: true if joystick axis value >= dac_value
-bool hal_joystick_compare(int port, int axis, uint8_t dac_value);
-
-// Update joystick ADC readings (call once per frame)
-void hal_joystick_update(void);
+bool    hal_joystick_compare(int port, int axis, uint8_t dac_value);
+void    hal_joystick_update(void);
+#else
+static inline void    hal_joystick_init(void)                                {}
+static inline uint8_t hal_joystick_read_axis(int, int)                      { return 0; }
+static inline uint8_t hal_joystick_read_button(int)                         { return 0; }
+static inline bool    hal_joystick_compare(int, int, uint8_t)               { return false; }
+static inline void    hal_joystick_update(void)                             {}
+#endif
 
 // Set machine pointer for keyboard hotkeys (F2 reset, etc.)
 struct Machine;
@@ -142,6 +152,9 @@ void hal_video_force_repaint(void);
 
 // Toggle FPS overlay
 void hal_video_toggle_fps_overlay(void);
+
+// Diagnostic: fill sprite with color and push (used to verify SPI post-init)
+void hal_video_push_test_color(uint16_t color);
 
 // ============================================================
 // Keyboard injection (for integration tests)

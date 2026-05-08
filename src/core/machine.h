@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : machine.h
  *  Module : CoCo 2 machine interface — CPU, memory map, I/O dispatch, and IRQ routing
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -52,9 +52,9 @@ typedef struct Machine {
 
     // --- Memory (allocated from PSRAM if available, else heap) ---
     uint8_t* ram;           // 64 KB main RAM
-    uint8_t* rom_basic;     // 8 KB Color BASIC ($A000-$BFFF)
-    uint8_t* rom_extbas;    // 8 KB Extended BASIC ($8000-$9FFF)
-    uint8_t* rom_cart;      // 16 KB Cartridge / Disk BASIC ($C000-$FEFF)
+    const uint8_t* rom_basic;   // 8 KB Color BASIC ($A000-$BFFF)
+    const uint8_t* rom_extbas;  // 8 KB Extended BASIC ($8000-$9FFF)
+    const uint8_t* rom_cart;    // 16 KB Cartridge / Disk BASIC ($C000-$FEFF)
 
     size_t   ram_size;
     bool     rom_basic_loaded;

@@ -1,16 +1,16 @@
 #pragma GCC optimize("O2")
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : machine.cpp
  *  Module : CoCo 2 machine integration — wires CPU, PIAs, VDG, SAM, and memory map
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -38,6 +38,13 @@
 #include "machine.h"
 #include "../hal/hal.h"
 #include "../utils/debug.h"
+#include "../roms/rom_loader.h"
+
+#if USE_EMBEDDED_ROMS
+#include "../roms/bas13_rom.h"
+#include "../roms/extbas11_rom.h"
+#include "../roms/disk11_rom.h"
+#endif
 
 // Global machine pointer for CPU memory callbacks
 static Machine* g_machine = nullptr;
@@ -120,19 +127,11 @@ uint8_t machine_read(uint16_t addr) {
                 if (hal_joystick_read_button(1))
                     row_data &= ~0x02;
 
-                // Joystick comparator on PA7 (matches XRoar joystick_update exactly):
-                //   port = PIA0 CRB bit 3 (CB2 output select)
-                //   axis = PIA0 CRA bit 3 (CA2 output select)
-                //   dac  = (PIA1 DA & 0xFC) + 2  (8-bit, range 2-254)
-                //   js   = axis_6bit * 4 + 2      (scale 0-63 → 2-254)
-                //
-                // Refresh ADC once per scanline (not every PIA read) so asm
-                // programs polling in tight loops see updated joystick values.
+#if JOYSTICK_ENABLED
+                // Joystick comparator on PA7 (matches XRoar joystick_update exactly)
                 {
-                    // Refresh ADC every 16 scanlines (~16 updates/frame).
-                    // Enough for responsive input without excessive ADC overhead.
                     static uint32_t last_joy_scanline = UINT32_MAX;
-                    uint32_t joy_slot = m->scanline >> 4;  // divide by 16
+                    uint32_t joy_slot = m->scanline >> 4;
                     if (joy_slot != last_joy_scanline) {
                         last_joy_scanline = joy_slot;
                         hal_joystick_update();
@@ -146,6 +145,9 @@ uint8_t machine_read(uint16_t addr) {
                     else
                         row_data &= ~0x80;
                 }
+#else
+                row_data &= ~0x80;  // PA7=0: no joystick (Phase 2)
+#endif
 
                 mc6821_set_input_a(&m->pia0, row_data);
             }
@@ -335,6 +337,10 @@ void machine_write(uint16_t addr, uint8_t val) {
     }
 }
 
+// 64 KB machine RAM as a static array — avoids heap fragmentation on no-PSRAM targets.
+// The RAM is always needed and never freed, so static allocation is appropriate.
+static uint8_t s_machine_ram[COCO_RAM_SIZE];
+
 // ============================================================
 // Memory allocation helper
 // ============================================================
@@ -373,9 +379,20 @@ void machine_init(Machine* m) {
 
     // --- Allocate memory ---
     m->ram_size = COCO_RAM_SIZE;
-    m->ram = machine_alloc(m->ram_size, "RAM");
-    if (!m->ram) return;
+    m->ram = s_machine_ram;
+    memset(m->ram, 0, m->ram_size);
+    DEBUG_PRINTF("  RAM: %d bytes (static)", (int)m->ram_size);
 
+#if USE_EMBEDDED_ROMS
+    m->rom_basic         = bas13_rom;
+    m->rom_extbas        = extbas11_rom;
+    m->rom_cart          = disk11_rom;
+    m->rom_basic_loaded  = true;
+    m->rom_extbas_loaded = true;
+    m->rom_cart_loaded   = true;
+    m->cart_inserted     = true;
+    DEBUG_PRINT("  ROMs: using embedded flash images");
+#else
     m->rom_basic = machine_alloc(8192, "ROM-BASIC");
     if (!m->rom_basic) return;
 
@@ -386,9 +403,10 @@ void machine_init(Machine* m) {
     if (!m->rom_cart) return;
 
     // Fill ROM buffers with $FF (unloaded state)
-    memset(m->rom_basic, 0xFF, 8192);
-    memset(m->rom_extbas, 0xFF, 8192);
-    memset(m->rom_cart, 0xFF, 16384);
+    memset((uint8_t*)m->rom_basic,  0xFF, 8192);
+    memset((uint8_t*)m->rom_extbas, 0xFF, 8192);
+    memset((uint8_t*)m->rom_cart,   0xFF, 16384);
+#endif
 
     // --- Initialize core chips ---
     mc6809_init(&m->cpu);
@@ -423,12 +441,20 @@ void machine_init(Machine* m) {
 bool machine_load_roms(Machine* m, const char* rom_path) {
     if (!m->initialized) return false;
 
+#if USE_EMBEDDED_ROMS
+    DEBUG_PRINT("Machine: ROMs using embedded flash images");
+    rom_validate(m->rom_basic,  8192, "bas13");
+    rom_validate(m->rom_extbas, 8192, "extbas11");
+    if (m->rom_cart_loaded) rom_validate(m->rom_cart, 8192, "disk11");
+    return true;
+#endif
+
     DEBUG_PRINT("Machine: loading ROMs...");
     char path[64];
 
     // Color BASIC ROM → $A000-$BFFF (8K)
     snprintf(path, sizeof(path), "%s/%s", rom_path, ROM_BASIC_FILE);
-    if (hal_storage_load_file(path, m->rom_basic, 8192)) {
+    if (hal_storage_load_file(path, (uint8_t*)m->rom_basic, 8192)) {
         m->rom_basic_loaded = true;
         DEBUG_PRINTF("  Loaded %s → $A000-$BFFF", ROM_BASIC_FILE);
     } else {
@@ -437,7 +463,7 @@ bool machine_load_roms(Machine* m, const char* rom_path) {
 
     // Extended BASIC ROM → $8000-$9FFF (8K)
     snprintf(path, sizeof(path), "%s/%s", rom_path, ROM_EXT_BASIC_FILE);
-    if (hal_storage_load_file(path, m->rom_extbas, 8192)) {
+    if (hal_storage_load_file(path, (uint8_t*)m->rom_extbas, 8192)) {
         m->rom_extbas_loaded = true;
         DEBUG_PRINTF("  Loaded %s → $8000-$9FFF", ROM_EXT_BASIC_FILE);
     } else {
@@ -446,7 +472,7 @@ bool machine_load_roms(Machine* m, const char* rom_path) {
 
     // Disk BASIC / Cartridge ROM → $C000-$DFFF (8K-16K, optional)
     snprintf(path, sizeof(path), "%s/%s", rom_path, ROM_DISK_FILE);
-    if (hal_storage_load_file(path, m->rom_cart, 8192)) {
+    if (hal_storage_load_file(path, (uint8_t*)m->rom_cart, 8192)) {
         m->rom_cart_loaded = true;
         m->cart_inserted = true;
         DEBUG_PRINTF("  Loaded %s → $C000", ROM_DISK_FILE);
@@ -605,10 +631,12 @@ void machine_run_frame(Machine* m) {
 // ============================================================
 
 void machine_free(Machine* m) {
-    if (m->ram)        { free(m->ram);        m->ram = nullptr; }
-    if (m->rom_basic)  { free(m->rom_basic);  m->rom_basic = nullptr; }
-    if (m->rom_extbas) { free(m->rom_extbas); m->rom_extbas = nullptr; }
-    if (m->rom_cart)   { free(m->rom_cart);    m->rom_cart = nullptr; }
+    if (m->ram) { free(m->ram); m->ram = nullptr; }
+#if !USE_EMBEDDED_ROMS
+    if (m->rom_basic)  { free((void*)m->rom_basic);  m->rom_basic = nullptr; }
+    if (m->rom_extbas) { free((void*)m->rom_extbas); m->rom_extbas = nullptr; }
+    if (m->rom_cart)   { free((void*)m->rom_cart);   m->rom_cart = nullptr; }
+#endif
     m->initialized = false;
     DEBUG_PRINT("Machine: freed");
 }

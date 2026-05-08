@@ -1,15 +1,16 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : config.h
  *  Module : Hardware configuration — pin assignments, compile-time options, and build constants
- * ============================================================
+ *  Target : ESP CYD (Cheap Yellow Display — ESP32-2432S028R)
+ * =============================================================
  */
 
 #ifndef CONFIG_H
@@ -40,11 +41,11 @@
 // Display configuration
 // ============================================================
 
-// Display type: 0 = ILI9341 SPI (320x240)
+// Display type: 0 = ILI9341 SPI (320x240)  <-- CYD uses ILI9341
 //               1 = ST7789 SPI  (320x240)
 //               2 = Composite out
 //               3 = ST7796 SPI  (480x320)
-#define DISPLAY_TYPE            1
+#define DISPLAY_TYPE            0
 
 // Display resolution derived from display type
 #if DISPLAY_TYPE == 3
@@ -70,14 +71,14 @@
 // Image is clipped if it exceeds display size
 #define DISPLAY_ZOOM_X10        17
 
-// SPI display pins
-#define PIN_TFT_CS              10
+// SPI display pins — ESP CYD (ESP32-2432S028R) ILI9341
+#define PIN_TFT_CS              15
 #define PIN_TFT_DC              2
-#define PIN_TFT_RST             4
-#define PIN_TFT_MOSI            11
-#define PIN_TFT_SCLK            12
-#define PIN_TFT_MISO            -1
-#define PIN_TFT_BL              5    // Backlight (-1 to disable)
+#define PIN_TFT_RST             -1   // Not wired on CYD
+#define PIN_TFT_MOSI            13
+#define PIN_TFT_SCLK            14
+#define PIN_TFT_MISO            12
+#define PIN_TFT_BL              21   // Backlight active HIGH
 
 // SPI speed for display (Hz)
 #define TFT_SPI_FREQ            40000000
@@ -101,7 +102,8 @@
 //#define PIN_I2S_DOUT            22
 
 // DAC pin (if AUDIO_OUTPUT == 0, ESP32 DAC on GPIO25 or GPIO26)
-#define PIN_DAC_OUT             17
+// CYD has a built-in buzzer/speaker on GPIO26
+#define PIN_DAC_OUT             26
 
 // ============================================================
 // Input configuration
@@ -111,14 +113,36 @@
 //#define PIN_PS2_DATA            16
 //#define PIN_PS2_CLK             17
 
-// Joystick analog pins (directly connected pots or ADC)
-#define PIN_JOY0_X              9 
-#define PIN_JOY0_Y              8
-#define PIN_JOY0_BTN            18
+// Joystick analog pins — TBD for CYD (no built-in joystick)
+#define PIN_JOY0_X              36
+#define PIN_JOY0_Y              -1
+#define PIN_JOY0_BTN            -1
 
-#define PIN_JOY1_X              16
-#define PIN_JOY1_Y              15    // ADC1_CH3 (VN)
-#define PIN_JOY1_BTN            7
+#define PIN_JOY1_X              -1
+#define PIN_JOY1_Y              -1
+#define PIN_JOY1_BTN            -1
+
+// ── On-Screen Touch Keyboard (XPT2046 resistive touch) ───────────────────
+// CYD (ESP32-2432S028R) touch SPI pins are dedicated — NOT shared with TFT.
+// TFT uses VSPI (GPIO13/14/12/15); touch uses its own bus via HSPI.
+#define TOUCH_KB_ENABLED        1
+
+#define PIN_TOUCH_CS            33
+#define PIN_TOUCH_MOSI          32
+#define PIN_TOUCH_SCLK          25
+#define PIN_TOUCH_MISO          39
+#define PIN_TOUCH_IRQ           36
+
+// Raw ADC calibration — adjust TOUCH_X/Y_MIN/MAX if touch coordinates are off
+#define TOUCH_X_MIN             250
+#define TOUCH_X_MAX             3830
+#define TOUCH_Y_MIN             385
+#define TOUCH_Y_MAX             3750
+#define TOUCH_ROTATION          1    // landscape; matches tft.setRotation(1)
+
+// Set to 1 to ignore NVS-saved calibration and always use the values above.
+// Useful when the NVS calibration is bad and the 6-point routine is unavailable.
+#define TOUCH_CAL_OVERRIDE      0
 
 // ============================================================
 // Storage configuration
@@ -127,11 +151,11 @@
 // Storage type: 0 = SD card (SPI), 1 = SPIFFS, 2 = LittleFS
 #define STORAGE_TYPE            0
 
-// SD card SPI pins (dedicated bus — NOT shared with TFT)
-#define PIN_SD_CS               38
-#define PIN_SD_MOSI             40
-#define PIN_SD_MISO             41
-#define PIN_SD_SCLK             39
+// SD card SPI pins — ESP CYD (ESP32-2432S028R)
+#define PIN_SD_CS               5
+#define PIN_SD_MOSI             23
+#define PIN_SD_MISO             19
+#define PIN_SD_SCLK             18
 
 // ROM file paths (on SD or SPIFFS)
 #define ROM_BASE_PATH           "/roms"
@@ -144,7 +168,14 @@
 // ============================================================
 
 // Use PSRAM for emulated RAM if available
-#define USE_PSRAM               1
+// Standard CYD (ESP32-2432S028R) has no PSRAM — keep 0
+#define USE_PSRAM               0
+
+// CYD Phase 1 port flags
+#define USE_EMBEDDED_ROMS       1   // ROMs baked into flash, not loaded from SD
+#define USE_USB_HOST            0   // No USB OTG on standard ESP32 CYD
+#define DISK_ENABLED            1   // Direct per-sector SD access, no PSRAM cache
+#define JOYSTICK_ENABLED        0   // Defer to Phase 2; floating ADC corrupts comparator
 
 // CoCo memory map sizes
 #define COCO_RAM_SIZE           (RAM_SIZE_KB * 1024)

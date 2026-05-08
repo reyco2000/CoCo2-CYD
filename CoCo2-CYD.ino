@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   ESP32_CoCo2_XRoar_Port Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
- *  File   : ESP32_CoCo2_XRoar_Port.ino
- *  Module : Main Arduino sketch — setup/loop entry point for CoCo 2 emulator on ESP32-S3
- * ============================================================
+ * =============================================================
+ *  File   : CoCo2-CYD.ino
+ *  Module : Main Arduino sketch — setup/loop entry point
+ * =============================================================
  */
 
 #include "config.h"
@@ -32,37 +32,43 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Turn off onboard RGB LED (NeoPixel on GPIO 48)
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
-
     DEBUG_PRINT("=================================");
-    DEBUG_PRINT("CoCo_ESP32 - Starting up...");
+    DEBUG_PRINT("CoCo2-CYD - Starting up...");
     DEBUG_PRINTF("CPU freq: %d MHz", ESP.getCpuFreqMHz());
     DEBUG_PRINT("----- Memory Report -----");
     DEBUG_PRINTF("SRAM  total: %d bytes", ESP.getHeapSize());
     DEBUG_PRINTF("SRAM  free:  %d bytes", ESP.getFreeHeap());
     DEBUG_PRINTF("SRAM  used:  %d bytes", ESP.getHeapSize() - ESP.getFreeHeap());
     DEBUG_PRINTF("SRAM  min free ever: %d bytes", ESP.getMinFreeHeap());
+#if USE_PSRAM
     DEBUG_PRINTF("PSRAM total: %d bytes", ESP.getPsramSize());
     DEBUG_PRINTF("PSRAM free:  %d bytes", ESP.getFreePsram());
     DEBUG_PRINTF("PSRAM used:  %d bytes", ESP.getPsramSize() - ESP.getFreePsram());
     DEBUG_PRINTF("PSRAM min free ever: %d bytes", ESP.getMinFreePsram());
+#endif
     DEBUG_PRINT("-------------------------");
     DEBUG_PRINT("=================================");
 
-    // Initialize HAL (storage, audio, keyboard, joystick — but NOT video yet)
+    // Initialize HAL audio + keyboard (storage and video deferred — see below)
     hal_init();
 
-    // Initialize emulated machine
+    // Init display BEFORE machine_init: sprite needs a contiguous 98 KB block.
+    // machine_init() allocates 64 KB for machine RAM which fragments the heap,
+    // so the sprite must be claimed first.
+    hal_video_init();
+
+    // Init SD AFTER video: TFT_eSPI::begin() routes VSPI to default pins
+    // (18/19/23/5) which collide with the SD card's HSPI pins. Initializing
+    // storage last lets HSPI take those GPIO outputs back cleanly.
+    hal_storage_init();
+
+    // Initialize emulated machine (allocates 64 KB machine RAM)
     machine_init(&coco);
 
-    // Load ROM images BEFORE video init (SD and TFT share SPI bus)
+    // Load/validate ROM images (embedded in flash on CYD — no SD reads needed)
     if (!machine_load_roms(&coco)) {
         DEBUG_PRINT("WARNING: ROM loading failed - running without ROMs");
     }
-
-    // Now safe to init TFT display (takes over shared SPI bus)
-    hal_video_init();
 
     // Cold reset
     machine_reset(&coco);
@@ -74,9 +80,12 @@ void setup() {
 
     DEBUG_PRINT("=== Post-Init Memory Report ===");
     DEBUG_PRINTF("SRAM  free:  %d bytes (used: %d)", ESP.getFreeHeap(), ESP.getHeapSize() - ESP.getFreeHeap());
+#if USE_PSRAM
     DEBUG_PRINTF("PSRAM free:  %d bytes (used: %d)", ESP.getFreePsram(), ESP.getPsramSize() - ESP.getFreePsram());
+#endif
     DEBUG_PRINT("===============================");
 
+#if USE_USB_HOST
     // Wait for USB keyboard to enumerate (up to 3 seconds)
     {
         uint32_t kbd_wait_start = millis();
@@ -89,15 +98,15 @@ void setup() {
             DEBUG_PRINT("USB Keyboard not detected (timeout) - will connect when plugged in");
         }
     }
+#else
+    DEBUG_PRINT("Keyboard: no USB host on CYD (Phase 2: touch/BT/PS2)");
+#endif
 
     DEBUG_PRINT("Entering main loop...");
 
 #ifdef RUN_INTEGRATION_TESTS
-    Serial.println("\n*** LOADM Verify Test Ready ***");
-    Serial.println("1. Mount disk with ZAXXON.BIN");
-    Serial.println("2. Type LOADM\"ZAXXON\" on CoCo keyboard + ENTER");
-    Serial.println("3. Wait for OK prompt, then send 'R' via serial to verify RAM");
-    Serial.println("Commands: R=verify, S=report, D=VRAM hex, T=screen text");
+    Serial.println("\n*** Integration Test Ready ***");
+    Serial.println("Commands: R=run tests, S=report, D=VRAM hex, T=screen text");
 #endif
 }
 
@@ -130,8 +139,11 @@ void loop() {
     // Run one video frame worth of emulation
     machine_run_frame(&coco);
 
-    // Push framebuffer to display
-    hal_render_frame();
+    // Push framebuffer to display (suppressed while OSK covers the screen)
+    if (!hal_keyboard_osk_visible()) {
+        hal_render_frame();
+    }
+    hal_keyboard_draw_overlay();  // hotzone always visible after emulation frames
 
     // Sound frequency debug — detect end-of-sound and report
     hal_audio_debug_tick();

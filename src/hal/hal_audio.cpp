@@ -1,22 +1,22 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal_audio.cpp
- *  Module : Audio HAL — LEDC PWM pseudo-DAC with cycle-accurate playback
- * ============================================================
+ *  Module : Audio HAL — ESP32 native DAC with cycle-accurate playback
+ * =============================================================
  */
 
 /*
- * hal_audio.cpp - CoCo audio output via LEDC PWM on ESP32-S3
+ * hal_audio.cpp - CoCo audio output via ESP32 native DAC on GPIO26
  *
- * ESP32-S3 has NO internal DAC — uses LEDC PWM at 78 kHz with
- * 8-bit resolution for pseudo-analog audio output.
+ * Standard ESP32 has a built-in 8-bit DAC on GPIO25 (DAC1) and GPIO26 (DAC2).
+ * CYD board wires GPIO26 to the onboard buzzer/speaker.
  *
  * Pitch-corrected playback:
  *   The emulated CPU runs ~2.6x faster than a real 0.895 MHz 6809,
@@ -29,19 +29,14 @@
  * Two audio paths (matching real CoCo hardware):
  *   1. Single-bit: PIA1 port B bit 1 (cassette, simple beeps)
  *   2. 6-bit DAC:  PIA1 port A bits 2-7 (SOUND command, music)
- *
- * Based on CoCo_Audio_Test/CoCoAudio implementation.
  */
 
 #include "hal.h"
 #include "../utils/debug.h"
-#include "soc/ledc_struct.h"
+#include "soc/rtc_io_reg.h"
 
 
-// Audio output pin (LEDC PWM)
-#define AUDIO_DAC_PIN       17
-#define AUDIO_LEDC_FREQ     78125    // 78.125 kHz PWM
-#define AUDIO_LEDC_BITS     8        // 8-bit resolution (0-255)
+// GPIO26 = DAC2 on standard ESP32; PIN_DAC_OUT defined in config.h
 #define AUDIO_ISR_RATE      22050    // Sample rate
 
 // ---- Pitch-corrected scanline buffer ----
@@ -63,9 +58,6 @@ static volatile int  audio_read_buf  = 1;   // ISR reads from this one
 static volatile int  audio_write_pos = 0;   // next scanline to write
 static volatile uint32_t audio_isr_pos_q8 = 0;  // ISR read position (Q8 fixed-point)
 static volatile bool audio_buf_ready = false;    // new buffer committed
-
-// LEDC channel
-static volatile uint8_t audio_ledc_channel = 0;
 
 // Current audio output level (0-255), set by either audio path
 // Still used as the "live" value captured at each scanline
@@ -99,31 +91,27 @@ static void IRAM_ATTR audio_timer_isr() {
     // Advance playback position
     audio_isr_pos_q8 += ISR_STRIDE_Q8;
 
-    // Output to PWM
-    LEDC.channel_group[0].channel[audio_ledc_channel].duty.duty = sample << 4;
-    LEDC.channel_group[0].channel[audio_ledc_channel].conf0.low_speed_update = 1;
-    LEDC.channel_group[0].channel[audio_ledc_channel].conf1.duty_start = 1;
+    // Output to ESP32 native DAC (GPIO26 = DAC2)
+    SET_PERI_REG_BITS(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_DAC, sample, RTC_IO_PDAC2_DAC_S);
 }
 
 void hal_audio_init(void) {
-    // Initialize LEDC PWM
-    audio_ledc_channel = 0;
-    ledcAttachChannel(AUDIO_DAC_PIN, AUDIO_LEDC_FREQ, AUDIO_LEDC_BITS, audio_ledc_channel);
-    ledcWrite(AUDIO_DAC_PIN, 128);
+    // Enable ESP32 native DAC on GPIO26 (DAC2) and set to silence
+    dacWrite(PIN_DAC_OUT, 128);
 
-    // Fill both buffers with silence (midpoint)
-    memset(audio_scanline_buf[0], 128, SAMPLES_PER_FRAME);
-    memset(audio_scanline_buf[1], 128, SAMPLES_PER_FRAME);
+    // Fill both buffers with silence (midpoint of 0-15 range)
+    memset(audio_scanline_buf[0], 7, SAMPLES_PER_FRAME);
+    memset(audio_scanline_buf[1], 7, SAMPLES_PER_FRAME);
 
     // Initialize timer ISR at sample rate
     audio_timer = timerBegin(1000000);
     timerAttachInterrupt(audio_timer, audio_timer_isr);
     timerAlarm(audio_timer, 1000000 / AUDIO_ISR_RATE, true, 0);
 
-    audio_current_level = 128;
+    audio_current_level = 7;
 
-    DEBUG_PRINTF("  Audio: LEDC PWM on GPIO%d, %d Hz ISR, stride Q8=%d",
-                 AUDIO_DAC_PIN, AUDIO_ISR_RATE, ISR_STRIDE_Q8);
+    DEBUG_PRINTF("  Audio: ESP32 DAC on GPIO%d, %d Hz ISR, stride Q8=%d",
+                 PIN_DAC_OUT, AUDIO_ISR_RATE, ISR_STRIDE_Q8);
 }
 
 void hal_audio_write_sample(int16_t left, int16_t right) {
@@ -161,7 +149,7 @@ void hal_audio_commit_frame(void) {
 
 // Single-bit audio: PIA1 port B bit 1
 void hal_audio_write_bit(bool value) {
-    audio_current_level = value ? 255 : 0;
+    audio_current_level = value ? 15 : 0;
 }
 
 // Called from main loop once per frame (reserved for future diagnostics)
@@ -170,6 +158,6 @@ void hal_audio_debug_tick(void) {
 
 // 6-bit DAC audio: PIA1 port A bits 2-7 (value 0-63)
 void hal_audio_write_dac(uint8_t dac6) {
-    // Scale 6-bit (0-63) to 8-bit (0-255)
-    audio_current_level = (dac6 << 2) | (dac6 >> 4);
+    // Scale 6-bit (0-63) to 0-30
+    audio_current_level = (uint8_t)((dac6 * 15) / 63);
 }

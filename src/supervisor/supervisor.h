@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : supervisor.h
  *  Module : OSD supervisor interface — overlay lifecycle and event dispatch
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -47,9 +47,6 @@ typedef struct Supervisor_t {
 
     Machine* machine;
 
-    // Framebuffer snapshot (PSRAM)
-    uint16_t* emu_snapshot;
-
     // Menu state
     int8_t   menu_cursor;
     int8_t   menu_scroll_offset;
@@ -71,6 +68,10 @@ typedef struct Supervisor_t {
     void* confirm_context;
     bool  confirm_yes_selected;
 
+    // Two-tap touch arming (-1 = nothing armed). Tap arms a row;
+    // a second tap on the same row executes. Reset on state change.
+    int16_t  touch_armed_row;
+
     // Rendering
     bool     needs_redraw;
     uint32_t last_blink_ms;
@@ -84,6 +85,7 @@ void supervisor_toggle(void);
 bool supervisor_is_active(void);
 
 void supervisor_on_key(uint8_t hid_usage, bool pressed);
+void supervisor_on_touch(uint16_t x, uint16_t y, bool pressed);
 
 // Returns true if supervisor consumed the frame (skip emulation)
 bool supervisor_update_and_render(void);

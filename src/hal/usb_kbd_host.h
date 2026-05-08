@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : usb_kbd_host.h
  *  Module : USB HID Host interface — key event queue and callback registration
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -37,6 +37,10 @@
 #ifndef USB_KBD_HOST_H
 #define USB_KBD_HOST_H
 
+#include "../../config.h"
+
+#if USE_USB_HOST
+
 #include <Arduino.h>
 #include <stdint.h>
 
@@ -54,5 +58,14 @@ void hid_host_process();
 
 // Returns true when a USB HID keyboard is currently enumerated.
 bool hid_host_is_connected();
+
+#else  // !USE_USB_HOST — stub out so callers compile without changes
+
+typedef void (*hid_key_callback_t)(uint8_t usage, uint8_t modifiers, bool pressed);
+static inline void hid_host_begin(hid_key_callback_t) {}
+static inline void hid_host_process() {}
+static inline bool hid_host_is_connected() { return false; }
+
+#endif // USE_USB_HOST
 
 #endif // USB_KBD_HOST_H

@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal_video.cpp
  *  Module : Video HAL — MC6847 palette output to ILI9341 TFT via TFT_eSPI with frame skipping
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -123,7 +123,15 @@ static void init_palette() {
     palette_rgb565[VDG_COLOR_DARK_ORANGE]    = 0x6800;  // (108, 0, 0)
     palette_rgb565[VDG_COLOR_BRIGHT_ORANGE]  = 0xFDA8;  // (255, 180, 67)
 
-    // Pre-swap bytes for direct framebuffer writes
+    // ILI9341_2_DRIVER initialises with MADCTL BGR=1 (0x08), meaning the panel
+    // interprets bits[15:11] as Blue and bits[4:0] as Red (swapped vs RGB565).
+    // Compensate by swapping R and B channels in the palette before byte-swap.
+    for (int i = 0; i < 16; i++) {
+        uint16_t c = palette_rgb565[i];
+        palette_rgb565[i] = ((c & 0x001F) << 11) | (c & 0x07E0) | ((c >> 11) & 0x001F);
+    }
+
+    // Pre-swap bytes for direct framebuffer writes (little-endian DMA → big-endian SPI)
     for (int i = 0; i < 16; i++) {
         uint16_t c = palette_rgb565[i];
         palette_swapped[i] = (c >> 8) | (c << 8);
@@ -140,7 +148,6 @@ void hal_video_init(void) {
     tft.setRotation(1);
 #else
     // ST7789/ILI9341 320x240: rotation 1 = landscape
-    tft.invertDisplay(false);
     tft.setRotation(1);
 #endif
 
@@ -169,14 +176,18 @@ void hal_video_init(void) {
 
     sprite = new TFT_eSprite(&tft);
     sprite->setColorDepth(16);
+#if USE_PSRAM
     sprite->setAttribute(PSRAM_ENABLE, true);
-
     void* sptr = sprite->createSprite(SPRITE_W, SPRITE_H);
     if (!sptr) {
         DEBUG_PRINT("  Video: PSRAM sprite failed, trying heap...");
         sprite->setAttribute(PSRAM_ENABLE, false);
         sptr = sprite->createSprite(SPRITE_W, SPRITE_H);
     }
+#else
+    sprite->setAttribute(PSRAM_ENABLE, false);
+    void* sptr = sprite->createSprite(SPRITE_W, SPRITE_H);
+#endif
 
     if (sptr) {
         display_available = true;
@@ -269,6 +280,7 @@ void hal_video_toggle_fps_overlay(void) {
 
 void hal_video_present(const uint8_t* ram, uint16_t vdg_base, uint8_t vdg_mode) {
     if (!display_available || !sprite) return;
+    if (hal_keyboard_osk_visible()) return;  // OSK owns the display; don't overwrite it
 
     // Count every emulated frame for accurate FPS
     if (fps_overlay_enabled) {
@@ -294,10 +306,9 @@ void hal_video_present(const uint8_t* ram, uint16_t vdg_base, uint8_t vdg_mode) 
         force_push_count = 10;  // Force next 10 frames to push
     }
 
-    // Check if anything changed: base address, mode bits, or VRAM content
     if (ram && force_push_count == 0 &&
         memcmp(vram_shadow, ram + vdg_base, vram_size) == 0) {
-        return;  // No change — skip SPI push
+        return;
     }
 
     if (force_push_count > 0) force_push_count--;
@@ -313,9 +324,18 @@ void hal_video_present(const uint8_t* ram, uint16_t vdg_base, uint8_t vdg_mode) 
     if (fps_overlay_enabled) {
         fps_overlay_draw();
     }
+    hal_keyboard_draw_overlay();  // hotzone buttons always visible in border
 }
 
 // Expose TFT instance for supervisor OSD rendering
 TFT_eSPI* hal_video_get_tft(void) {
     return display_available ? &tft : nullptr;
+}
+
+void hal_video_push_test_color(uint16_t color) {
+    if (!display_available || !sprite) return;
+    sprite->fillSprite(color);
+    sprite->pushSprite(SPR_X, SPR_Y);
+    sprite->fillSprite(TFT_BLACK);
+    DEBUG_PRINTF("  Video: test color push 0x%04X", color);
 }

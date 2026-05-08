@@ -1,15 +1,18 @@
+#include "../../config.h"
+#if DISK_ENABLED
+
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_filebrowser.cpp
  *  Module : SD card file browser — FAT32 directory browser for .DSK/.VDK disk image selection
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -72,7 +75,9 @@ static int strcasecmp_wrapper(const char* a, const char* b) {
 }
 
 int sv_fb_scan_directory(const char* path, SV_FileEntry* entries, int max_entries) {
+    DEBUG_PRINTF("[FB] cardType=%d totalMB=%llu opening=%s", (int)SD.cardType(), SD.totalBytes()/1048576, path);
     File dir = SD.open(path);
+    DEBUG_PRINTF("[FB] dir=%s isDir=%d", dir ? "ok" : "FAIL", dir ? (int)dir.isDirectory() : -1);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
         return 0;
@@ -235,10 +240,9 @@ static void select_file(Supervisor_t* sv, const char* filename) {
         }
     }
 
-    // Return to inactive (close supervisor)
-    sv->state = SV_INACTIVE;
-    sv->needs_redraw = true;
-    // The supervisor_toggle deactivation path will restore the framebuffer
+    // Close the supervisor through the normal toggle path so the framebuffer
+    // is restored and any margin pixels (scrollbar, FPS overlay) are wiped.
+    supervisor_toggle();
 }
 
 void sv_filebrowser_on_key(Supervisor_t* sv, uint8_t hid_usage, bool pressed) {
@@ -315,6 +319,66 @@ void sv_filebrowser_on_key(Supervisor_t* sv, uint8_t hid_usage, bool pressed) {
     }
 }
 
+void sv_filebrowser_on_touch(Supervisor_t* sv, uint16_t x, uint16_t y) {
+    // Tap title bar to return to the previous screen (main menu or disk manager)
+    if ((int)y >= SV_BORDER_Y && (int)y < SV_BORDER_Y + SV_TITLE_H) {
+        sv->state = sv->prev_state;
+        sv->needs_redraw = true;
+        return;
+    }
+    if (sv->file_count == 0) return;
+
+    // Scrollbar tap — scrub to proportional position. Accept any tap in the
+    // right margin (past the OSD border) so a shy touch calibration at the
+    // far edge still hits the scrollbar.
+    if (sv->file_count > SV_FB_VISIBLE_ITEMS &&
+        (int)x >= SV_BORDER_X + SV_BORDER_W) {
+        int sb_y = SV_CONTENT_Y;
+        int sb_h = SV_FB_VISIBLE_ITEMS * SV_ITEM_H;
+        int tap_y = (int)y < sb_y ? sb_y : ((int)y >= sb_y + sb_h ? sb_y + sb_h - 1 : (int)y);
+        int max_offset = sv->file_count - SV_FB_VISIBLE_ITEMS;
+        sv->file_scroll_offset = ((tap_y - sb_y) * max_offset) / (sb_h - 1);
+        if (sv->file_scroll_offset < 0) sv->file_scroll_offset = 0;
+        if (sv->file_scroll_offset > max_offset) sv->file_scroll_offset = max_offset;
+        if (sv->file_cursor < sv->file_scroll_offset)
+            sv->file_cursor = sv->file_scroll_offset;
+        if (sv->file_cursor >= sv->file_scroll_offset + SV_FB_VISIBLE_ITEMS)
+            sv->file_cursor = sv->file_scroll_offset + SV_FB_VISIBLE_ITEMS - 1;
+        sv->needs_redraw = true;
+        return;
+    }
+
+    if (x < SV_BORDER_X || x >= SV_BORDER_X + SV_BORDER_W) return;
+
+    int visible = (sv->file_count < SV_FB_VISIBLE_ITEMS) ? sv->file_count : SV_FB_VISIBLE_ITEMS;
+    for (int i = 0; i < visible; i++) {
+        int row_y = SV_CONTENT_Y + i * SV_ITEM_H;
+        if ((int)y >= row_y && (int)y < row_y + SV_ITEM_H) {
+            int idx = sv->file_scroll_offset + i;
+            if (idx < 0 || idx >= sv->file_count) return;
+            SV_FileEntry* e = &sv->file_entries[idx];
+            // Only arm/execute on selectable rows (directories or supported files)
+            if (!e->is_dir && !e->is_supported) return;
+
+            if (sv->touch_armed_row == idx) {
+                // Second tap on the same entry → enter or mount
+                sv->touch_armed_row = -1;
+                if (e->is_dir) {
+                    enter_directory(sv, e->name);
+                } else {
+                    select_file(sv, e->name);
+                }
+            } else {
+                // First tap (or moving to a new row) → arm and highlight
+                sv->touch_armed_row = idx;
+                sv->file_cursor = idx;
+                sv->needs_redraw = true;
+            }
+            return;
+        }
+    }
+}
+
 void sv_filebrowser_render(Supervisor_t* sv) {
     char title[48];
     snprintf(title, sizeof(title), "Mount Disk -> Drive %d", sv->target_drive);
@@ -354,3 +418,5 @@ const char* sv_filebrowser_get_selected_path(Supervisor_t* sv) {
     (void)sv;
     return has_selection ? selected_path : nullptr;
 }
+
+#endif // DISK_ENABLED

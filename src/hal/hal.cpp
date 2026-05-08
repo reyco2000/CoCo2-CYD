@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal.cpp
  *  Module : HAL top-level — initialization and per-frame dispatch to subsystem drivers
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -20,27 +20,31 @@
 
 #include "hal.h"
 #include "../utils/debug.h"
-#include "usb_kbd_host.h"
+#include "usb_kbd_host.h"  // stubs when USE_USB_HOST=0
+#include "hal_touch_cal.h"
 
 void hal_init(void) {
     DEBUG_PRINT("HAL: initializing subsystems...");
-    hal_storage_init();
-    // NOTE: hal_video_init() is called AFTER ROM loading in setup()
-    // because TFT_eSPI takes over the shared SPI bus (pins 11/12/13)
-    // and SD card reads would hang after TFT init.
+    // NOTE: hal_storage_init() is called from setup() AFTER hal_video_init().
+    // TFT_eSPI's internal spi.begin() with default VSPI pins (GPIO 18/19/23/5)
+    // hijacks those GPIO matrix outputs — running SD init last lets HSPI take
+    // them back without an explicit restore step.
     hal_audio_init();
     hal_keyboard_init();
+#if JOYSTICK_ENABLED
     hal_joystick_init();
-    DEBUG_PRINT("HAL: init complete (video deferred)");
+#endif
+    DEBUG_PRINT("HAL: init complete (video + storage deferred)");
 }
 
 void hal_process_input(void) {
-    // Tick deferred key releases (ensures keys stay held for min frames)
     hal_keyboard_tick();
-    // Drain USB HID key events from Core 0 queue
-    hid_host_process();
-    // Update joystick ADC readings
+    hid_host_process();        // no-op when USE_USB_HOST=0
+    hal_keyboard_update_touch(); // no-op when TOUCH_KB_ENABLED=0
+    touch_cal_check_boot_button();
+#if JOYSTICK_ENABLED
     hal_joystick_update();
+#endif
 }
 
 void hal_render_frame(void) {

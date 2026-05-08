@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_render.h
  *  Module : OSD rendering engine interface
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -61,6 +61,9 @@
 #define SV_CONTENT_Y    (SV_BORDER_Y + SV_TITLE_H + 4)
 #define SV_CONTENT_W    (SV_BORDER_W - 16)
 #define SV_VALUE_RIGHT  (SV_BORDER_X + SV_BORDER_W - 8)
+// Scrollbar sits in the right margin, outside the border box
+#define SV_SCROLLBAR_W  12
+#define SV_SCROLLBAR_X  (SV_BORDER_X + SV_BORDER_W + 4)
 
 void sv_render_init(TFT_eSPI* tft);
 void sv_render_frame(const char* title, const char* footer);

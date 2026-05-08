@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_disk.h
  *  Module : Virtual FDC interface — WD1793-compatible disk controller (.DSK/.VDK format)
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -22,6 +22,10 @@
 
 #ifndef SV_DISK_H
 #define SV_DISK_H
+
+#include "../../config.h"
+
+#if DISK_ENABLED
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -49,9 +53,7 @@ struct SV_DiskImage {
     uint16_t header_size;
     uint32_t image_size;
 
-    // Entire disk image cached in PSRAM — eliminates SD read issues
-    uint8_t* cache;          // PSRAM buffer (ps_malloc), NULL if not cached
-    uint32_t cache_size;     // Size of data portion (excluding header)
+    uint32_t data_size;      // Image data bytes after header (tracks*spt*sector_size)
 };
 
 struct SV_DiskController {
@@ -119,6 +121,40 @@ const char* sv_disk_get_path(SV_DiskController* fdc, uint8_t drive);
 void sv_disk_flush(SV_DiskController* fdc, uint8_t drive);
 void sv_disk_flush_all(SV_DiskController* fdc);
 
+// Read one sector directly from the disk file into dst (256 bytes).
+// Returns true on success. Intended for integration tests and diagnostic code.
+bool sv_disk_read_sector_raw(SV_DiskController* fdc, uint8_t drive,
+                             uint8_t track, uint8_t sector, uint8_t* dst);
+
 bool sv_disk_detect_geometry(SV_DiskImage* img);
+
+#else  // !DISK_ENABLED — empty stubs so Machine struct and callers compile
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define SV_DISK_MAX_DRIVES 0
+
+struct SV_DiskImage {};
+
+struct SV_DiskController {
+    void (*nmi_callback)(void* ctx, bool active);
+    void (*halt_callback)(void* ctx, bool halted);
+    void* callback_context;
+};
+
+static inline void    sv_disk_init(SV_DiskController*)                              {}
+static inline void    sv_disk_reset(SV_DiskController*)                             {}
+static inline uint8_t sv_disk_read(SV_DiskController*, uint16_t)                   { return 0xFF; }
+static inline void    sv_disk_write(SV_DiskController*, uint16_t, uint8_t)         {}
+static inline void    sv_disk_tick(SV_DiskController*)                              {}
+static inline bool    sv_disk_mount(SV_DiskController*, uint8_t, const char*)      { return false; }
+static inline void    sv_disk_eject(SV_DiskController*, uint8_t)                   {}
+static inline bool    sv_disk_is_mounted(SV_DiskController*, uint8_t)              { return false; }
+static inline const char* sv_disk_get_path(SV_DiskController*, uint8_t)            { return ""; }
+static inline void    sv_disk_flush(SV_DiskController*, uint8_t)                   {}
+static inline void    sv_disk_flush_all(SV_DiskController*)                        {}
+
+#endif // DISK_ENABLED
 
 #endif // SV_DISK_H

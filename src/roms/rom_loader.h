@@ -1,16 +1,17 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : rom_loader.h
  *  Module : ROM loader interface — Dragon/CoCo ROM loading and CRC validation
- * ============================================================
+ * =============================================================
  */
+
 
 /*
  * rom_loader.h - ROM loading utilities
@@ -29,6 +30,7 @@
 #define CRC_EXTBAS11    0xA82A6254  // Extended Color BASIC 1.1
 #define CRC_EXTBAS10    0x6B7A269E  // Extended Color BASIC 1.0
 #define CRC_DISK11      0x0B9C914A  // Disk BASIC 1.1
+#define CRC_DISK11B     0x0B9C5415  // Disk BASIC 1.1 (alt dump)
 #define CRC_DISK10      0xC3525CF8  // Disk BASIC 1.0
 
 // CRC-32 for ROM validation

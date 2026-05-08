@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_render.cpp
  *  Module : OSD rendering engine — green phosphor UI using TFT_eSPI built-in fonts
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -34,6 +34,11 @@ void sv_render_frame(const char* title, const char* footer) {
 
     // Fill background
     g_tft->fillRect(SV_BORDER_X, SV_BORDER_Y, SV_BORDER_W, SV_BORDER_H, SV_COLOR_BG);
+
+    // Clear scrollbar zone (right margin) so a previous screen's scrollbar
+    // doesn't ghost onto this one. The scrollbar will be re-drawn by views
+    // that need it (e.g. file browser).
+    g_tft->fillRect(SV_SCROLLBAR_X, SV_BORDER_Y, SV_SCROLLBAR_W, SV_BORDER_H, SV_COLOR_BG);
 
     // Border
     g_tft->drawRect(SV_BORDER_X, SV_BORDER_Y, SV_BORDER_W, SV_BORDER_H, SV_COLOR_BORDER);
@@ -162,21 +167,34 @@ void sv_render_file_entry(int index, const char* name, uint32_t size,
 }
 
 void sv_render_scrollbar(int visible_start, int visible_count, int total_count) {
-    if (!g_tft || total_count <= visible_count) return;
+    if (!g_tft) return;
 
-    int sb_x = SV_BORDER_X + SV_BORDER_W - 4;
+    int sb_x = SV_SCROLLBAR_X;
     int sb_y = SV_CONTENT_Y;
     int sb_h = visible_count * SV_ITEM_H;
 
-    // Background
-    g_tft->drawFastVLine(sb_x, sb_y, sb_h, SV_COLOR_BG);
+    g_tft->startWrite();
 
-    // Thumb
+    if (total_count <= visible_count) {
+        // No scrolling needed — clear the track area and return
+        g_tft->fillRect(sb_x, sb_y, SV_SCROLLBAR_W, sb_h, SV_COLOR_BG);
+        g_tft->endWrite();
+        return;
+    }
+
+    // Track background
+    g_tft->fillRect(sb_x, sb_y, SV_SCROLLBAR_W, sb_h, SV_COLOR_DIM);
+
+    // Thumb — proportional height, clamped to minimum 8px
     int thumb_h = (visible_count * sb_h) / total_count;
-    if (thumb_h < 4) thumb_h = 4;
-    int thumb_y = sb_y + (visible_start * sb_h) / total_count;
+    if (thumb_h < 8) thumb_h = 8;
+    int range = total_count - visible_count;
+    int thumb_y = sb_y + (visible_start * (sb_h - thumb_h)) / range;
+    if (thumb_y + thumb_h > sb_y + sb_h) thumb_y = sb_y + sb_h - thumb_h;
 
-    g_tft->drawFastVLine(sb_x, thumb_y, thumb_h, SV_COLOR_DIM);
+    g_tft->fillRect(sb_x, thumb_y, SV_SCROLLBAR_W, thumb_h, SV_COLOR_BORDER);
+
+    g_tft->endWrite();
 }
 
 void sv_render_status_line(const char* text, uint16_t color) {

@@ -1,22 +1,22 @@
+#include "../../config.h"
+#if DISK_ENABLED  // Integration tests require disk subsystem
+
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : integration_test.cpp
- *  Module : Integration test framework — LOADM disk verification and VRAM screen inspection
- * ============================================================
+ *  Module : Integration test framework — keyboard injection and VRAM screen inspection
+ * =============================================================
  */
 
 /*
  * CoCo ESP32 - Integration Test Framework Implementation
- *
- * LOADM disk verification test: injects LOADM "filename" via keyboard,
- * then compares CoCo RAM with the raw file data read from the disk cache.
  *
  * KEYBOARD MATRIX (verified from BASIC ROM KEYIN routine):
  * hal_keyboard_press(row, col) where row=PA bit, col=PB bit.
@@ -48,7 +48,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <Arduino.h>
-#include <SD.h>
 
 // CoCo text screen constants
 static const uint16_t TEXT_SCREEN_ADDR = 0x0400;
@@ -324,489 +323,62 @@ void IntegrationTest::record(const char* name, bool passed, uint32_t frames, uin
 }
 
 // ============================================================================
-// RS-DOS disk helpers: read a file from disk cache
+// Test: BASIC Hello World
 // ============================================================================
 
-// Read a named file from disk cache by following RS-DOS directory + granule chain.
-// Allocates *file_buf with malloc (caller must free). Returns file size or -1.
-int IntegrationTest::read_rsdos_file(const char* filename, uint8_t** file_buf, int drive) {
-    SV_DiskImage* disk = &machine->fdc.drives[drive];
-    if (!disk->mounted || !disk->cache) {
-        Serial.printf("  [disk] Drive %d not mounted or no cache\n", drive);
-        return -1;
-    }
-
-    uint16_t sec_size = disk->sector_size;
-    uint8_t spt = disk->sectors_per_track;
-
-    // Helper lambda: get pointer to sector data in cache
-    // Track/sector are 0-based track, 1-based sector
-    auto sector_ptr = [&](int track, int sector) -> uint8_t* {
-        if (sector < 1 || sector > spt || track < 0 || track >= disk->tracks)
-            return nullptr;
-        uint32_t off = (uint32_t)track * spt * sec_size + (uint32_t)(sector - 1) * sec_size;
-        if (off + sec_size > disk->cache_size) return nullptr;
-        return disk->cache + off;
-    };
-
-    // Read FAT (track 17, sector 2)
-    uint8_t* fat = sector_ptr(RSDOS_DIR_TRACK, RSDOS_FAT_SECTOR);
-    if (!fat) {
-        Serial.println("  [disk] Cannot read FAT sector");
-        return -1;
-    }
-
-    // Build padded 8.3 filename for comparison (RS-DOS: 8-char name + 3-char ext, space-padded)
-    char name83[12]; // 8 + 3 + NUL
-    memset(name83, ' ', 11);
-    name83[11] = '\0';
-
-    // Parse "FILENAME" or "FILENAME.EXT"
-    const char* dot = strchr(filename, '.');
-    int name_len = dot ? (int)(dot - filename) : (int)strlen(filename);
-    if (name_len > 8) name_len = 8;
-    for (int i = 0; i < name_len; i++)
-        name83[i] = toupper(filename[i]);
-
-    if (dot) {
-        const char* ext = dot + 1;
-        int ext_len = strlen(ext);
-        if (ext_len > 3) ext_len = 3;
-        for (int i = 0; i < ext_len; i++)
-            name83[8 + i] = toupper(ext[i]);
-    }
-
-    Serial.printf("  [disk] Searching for '%.8s.%.3s' in directory\n", name83, name83 + 8);
-
-    // Scan directory (track 17, sectors 3-11)
-    int first_granule = -1;
-    int file_type = -1;
-    int ascii_flag = -1;
-
-    for (int sec = RSDOS_DIR_FIRST_SEC; sec <= RSDOS_DIR_LAST_SEC; sec++) {
-        uint8_t* dir = sector_ptr(RSDOS_DIR_TRACK, sec);
-        if (!dir) continue;
-
-        for (int e = 0; e < RSDOS_ENTRIES_PER_SEC; e++) {
-            uint8_t* entry = dir + e * RSDOS_DIR_ENTRY_SIZE;
-
-            // Byte 0: $00 = deleted, $FF = end of directory
-            if (entry[0] == 0xFF) goto dir_done;
-            if (entry[0] == 0x00) continue;
-
-            // Compare 8+3 name (bytes 0-7 = name, 8-10 = extension)
-            if (memcmp(entry, name83, 11) == 0) {
-                file_type = entry[11];     // 0=BASIC, 1=data, 2=ML
-                ascii_flag = entry[12];    // 0=binary, $FF=ASCII
-                first_granule = entry[13]; // First granule number
-                Serial.printf("  [disk] Found: type=%d ascii=%d first_gran=%d\n",
-                              file_type, ascii_flag, first_granule);
-                goto dir_done;
-            }
-        }
-    }
-dir_done:
-
-    if (first_granule < 0) {
-        Serial.printf("  [disk] File '%s' not found in directory\n", filename);
-        return -1;
-    }
-
-    // Follow granule chain to collect all sectors
-    // Granule N maps to: track = N/2, starting sector = (N%2)*9 + 1
-    // FAT[N]: $C0-$C9 = last granule, value & 0x0F = number of sectors used in last granule
-    //         $00-$43 = next granule number
-
-    // First pass: count total bytes
-    int total_bytes = 0;
-    int gran = first_granule;
-    int chain_len = 0;
-    const int MAX_CHAIN = 128; // safety limit
-
-    // Temporary chain storage
-    struct GranInfo { int granule; int sectors; };
-    GranInfo chain[MAX_CHAIN];
-
-    while (chain_len < MAX_CHAIN) {
-        if (gran < 0 || gran > 67) {
-            Serial.printf("  [disk] Invalid granule %d in chain\n", gran);
-            return -1;
-        }
-
-        uint8_t fat_entry = fat[gran];
-
-        if (fat_entry >= 0xC0 && fat_entry <= 0xC9) {
-            // Last granule: low nibble = sectors used (1-9)
-            int secs = fat_entry & 0x0F;
-            if (secs == 0) secs = 9; // $C0 means 9 sectors? Actually 0 means read last sector bytes from dir
-            // RS-DOS: bytes in last sector from directory entry bytes 16-17
-            chain[chain_len].granule = gran;
-            chain[chain_len].sectors = secs;
-            chain_len++;
-            total_bytes += secs * sec_size;
-            break;
-        } else {
-            // Full granule (9 sectors)
-            chain[chain_len].granule = gran;
-            chain[chain_len].sectors = RSDOS_GRANULE_SECTORS;
-            chain_len++;
-            total_bytes += RSDOS_GRANULE_SECTORS * sec_size;
-            gran = fat_entry;
-        }
-    }
-
-    // The last granule's last sector may not be fully used.
-    // RS-DOS directory entry bytes 14-15 (big-endian) = bytes used in last sector of last granule
-    // We need to re-scan directory for this — but for LOADM comparison we'll
-    // use the LOADM preamble to determine exact lengths. So read full sectors.
-
-    Serial.printf("  [disk] Granule chain: %d granules, %d bytes (full sectors)\n",
-                  chain_len, total_bytes);
-
-    if (total_bytes == 0) {
-        Serial.println("  [disk] File is empty");
-        return -1;
-    }
-
-    // Allocate buffer and read sectors
-    uint8_t* buf = (uint8_t*)malloc(total_bytes);
-    if (!buf) {
-        Serial.printf("  [disk] malloc(%d) failed\n", total_bytes);
-        return -1;
-    }
-
-    int offset = 0;
-    for (int ci = 0; ci < chain_len; ci++) {
-        int g = chain[ci].granule;
-        int nsecs = chain[ci].sectors;
-        int track = g / 2;
-        if (track >= RSDOS_DIR_TRACK) track++;  // skip directory track 17
-        int start_sector = (g % 2) * RSDOS_GRANULE_SECTORS + 1;
-
-        for (int s = 0; s < nsecs; s++) {
-            uint8_t* sp = sector_ptr(track, start_sector + s);
-            if (!sp) {
-                Serial.printf("  [disk] Bad sector: T%d S%d\n", track, start_sector + s);
-                free(buf);
-                return -1;
-            }
-            memcpy(buf + offset, sp, sec_size);
-            offset += sec_size;
-        }
-    }
-
-    Serial.printf("  [disk] Read %d bytes from disk cache\n", offset);
-    *file_buf = buf;
-    return offset;
-}
-
-// ============================================================================
-// Parse LOADM preamble/postamble
-// ============================================================================
-
-int IntegrationTest::parse_loadm_segments(const uint8_t* data, int size,
-                                           LoadmSegment* segs, int max_segs,
-                                           uint16_t* exec_addr) {
-    int pos = 0;
-    int seg_count = 0;
-    *exec_addr = 0;
-
-    while (pos < size && seg_count < max_segs) {
-        if (pos + 5 > size) break;
-
-        uint8_t type = data[pos];
-
-        if (type == LOADM_PREAMBLE) {
-            // Preamble: $00 len_hi len_lo addr_hi addr_lo data[len]
-            uint16_t len  = ((uint16_t)data[pos + 1] << 8) | data[pos + 2];
-            uint16_t addr = ((uint16_t)data[pos + 3] << 8) | data[pos + 4];
-            pos += 5;
-
-            if (len == 0) {
-                // Zero-length preamble = skip (sometimes used as padding)
-                continue;
-            }
-
-            segs[seg_count].addr = addr;
-            segs[seg_count].length = len;
-            segs[seg_count].file_off = pos;
-            seg_count++;
-
-            Serial.printf("  [loadm] Segment %d: $%04X len=%d (file offset %d)\n",
-                          seg_count, addr, len, pos);
-            pos += len;
-        } else if (type == LOADM_POSTAMBLE) {
-            // Postamble: $FF $00 $00 exec_hi exec_lo
-            *exec_addr = ((uint16_t)data[pos + 3] << 8) | data[pos + 4];
-            Serial.printf("  [loadm] Exec addr: $%04X\n", *exec_addr);
-            break;
-        } else {
-            Serial.printf("  [loadm] Unexpected byte $%02X at offset %d\n", type, pos);
-            break;
-        }
-    }
-
-    return seg_count;
-}
-
-// ============================================================================
-// Read a raw file from SD card. Allocates buffer with malloc (caller frees).
-// Returns file size or -1 on error.
-// ============================================================================
-
-int IntegrationTest::read_sd_file(const char* path, uint8_t** out_buf) {
-    if (!SD.exists(path)) {
-        Serial.printf("  [sd] File '%s' not found on SD card\n", path);
-        return -1;
-    }
-    File f = SD.open(path, FILE_READ);
-    if (!f) {
-        Serial.printf("  [sd] Failed to open '%s'\n", path);
-        return -1;
-    }
-    int sz = (int)f.size();
-    if (sz <= 0) {
-        f.close();
-        Serial.printf("  [sd] File '%s' is empty\n", path);
-        return -1;
-    }
-    uint8_t* buf = (uint8_t*)malloc(sz);
-    if (!buf) {
-        f.close();
-        Serial.printf("  [sd] malloc(%d) failed\n", sz);
-        return -1;
-    }
-    int rd = (int)f.read(buf, sz);
-    f.close();
-    if (rd != sz) {
-        Serial.printf("  [sd] Read %d of %d bytes\n", rd, sz);
-        free(buf);
-        return -1;
-    }
-    Serial.printf("  [sd] Read %d bytes from '%s'\n", sz, path);
-    *out_buf = buf;
-    return sz;
-}
-
-// ============================================================================
-// Compare two buffers, report matches/mismatches with hex dump
-// ============================================================================
-
-void IntegrationTest::compare_buffers(const char* label,
-                                       const uint8_t* expected, const uint8_t* actual,
-                                       int len, int base_addr) {
-    int matches = 0, mismatches = 0;
-    int first_mismatch = -1;
-
-    for (int i = 0; i < len; i++) {
-        if (expected[i] == actual[i]) {
-            matches++;
-        } else {
-            if (mismatches < 16) {
-                Serial.printf("    MISMATCH @$%04X: expected=$%02X got=$%02X (offset %d)\n",
-                              base_addr + i, expected[i], actual[i], i);
-            }
-            if (first_mismatch < 0) first_mismatch = i;
-            mismatches++;
-        }
-    }
-
-    Serial.printf("  [%s] %d bytes compared: %d match, %d mismatch",
-                  label, len, matches, mismatches);
-    if (base_addr >= 0)
-        Serial.printf(" (base addr $%04X)", base_addr);
-    Serial.println();
-
-    // Hex dump around first mismatch
-    if (first_mismatch >= 0) {
-        int dstart = (first_mismatch > 16) ? first_mismatch - 16 : 0;
-        int dend = first_mismatch + 32;
-        if (dend > len) dend = len;
-
-        Serial.printf("    Expected (offset %d):\n    ", dstart);
-        for (int i = dstart; i < dend; i++)
-            Serial.printf("%02X ", expected[i]);
-        Serial.println();
-
-        Serial.printf("    Actual   (offset %d):\n    ", dstart);
-        for (int i = dstart; i < dend; i++)
-            Serial.printf("%02X ", actual[i]);
-        Serial.println();
-    }
-}
-
-// ============================================================================
-// Test: LOADM verification
-// ============================================================================
-
-// User-triggered verification: user types LOADM on the CoCo keyboard,
-// then sends 'R' on serial to verify RAM against disk cache.
-//
-// Three-way comparison:
-// 1. SD card file vs disk image extraction (validates our RS-DOS reader)
-// 2. File data (after LOADM headers) vs CoCo RAM (validates the load)
-bool IntegrationTest::test_loadm_verify(const char* filename, int iterations) {
-    Serial.println("\n========================================");
-    Serial.println("=== LOADM Verify Test ===");
-    Serial.println("========================================");
-    Serial.printf("  File: %s\n", filename);
-
-    // --- Step 1: Read raw file from SD card ---
-    char sd_path[64];
-    snprintf(sd_path, sizeof(sd_path), "/%s", filename);
-    uint8_t* sd_data = nullptr;
-    int sd_size = read_sd_file(sd_path, &sd_data);
-
-    // --- Step 2: Read file from disk image cache ---
-    uint8_t* disk_data = nullptr;
-    int disk_size = read_rsdos_file(filename, &disk_data, 0);
-
-    // --- Step 3: Compare SD vs disk extraction ---
-    if (sd_data && sd_size > 0 && disk_data && disk_size > 0) {
-        Serial.println("\n--- SD Card vs Disk Image Extraction ---");
-        Serial.printf("  SD card file:   %d bytes\n", sd_size);
-        Serial.printf("  Disk extracted: %d bytes\n", disk_size);
-
-        int cmp_len = (sd_size < disk_size) ? sd_size : disk_size;
-        compare_buffers("SD vs Disk", sd_data, disk_data, cmp_len, -1);
-
-        if (sd_size != disk_size) {
-            Serial.printf("  WARNING: Size mismatch! SD=%d, Disk=%d (diff=%d)\n",
-                          sd_size, disk_size, disk_size - sd_size);
-            Serial.println("  Note: Disk extraction reads full sectors, SD file is exact size.");
-            Serial.println("  The disk may have extra padding bytes at the end.");
-        }
-    } else {
-        if (!sd_data || sd_size <= 0)
-            Serial.printf("  [INFO] No SD card file at '%s' — skipping SD comparison\n", sd_path);
-        if (!disk_data || disk_size <= 0) {
-            Serial.println("  [FAIL] Could not read file from disk cache");
-            if (sd_data) free(sd_data);
-            return false;
-        }
-    }
-
-    // --- Step 4: Parse LOADM segments from the file ---
-    // Use SD file if available (exact size), otherwise disk extraction
-    uint8_t* file_data = sd_data ? sd_data : disk_data;
-    int file_size = sd_data ? sd_size : disk_size;
-
-    Serial.println("\n--- LOADM Header Parsing ---");
-    Serial.printf("  First 16 bytes of file: ");
-    for (int i = 0; i < 16 && i < file_size; i++)
-        Serial.printf("%02X ", file_data[i]);
-    Serial.println();
-
-    LoadmSegment segs[MAX_LOADM_SEGMENTS];
-    uint16_t exec_addr = 0;
-    int seg_count = parse_loadm_segments(file_data, file_size, segs, MAX_LOADM_SEGMENTS, &exec_addr);
-
-    if (seg_count == 0) {
-        Serial.println("  [FAIL] No valid LOADM segments found");
-        if (sd_data) free(sd_data);
-        if (disk_data) free(disk_data);
+bool IntegrationTest::test_basic_hello_world() {
+    Serial.println("\n--- Test: BASIC Hello World ---");
+    if (!ensure_booted()) {
+        Serial.println("  [FAIL] Could not boot to BASIC prompt");
         return false;
     }
-
-    uint32_t total_data_bytes = 0;
-    for (int s = 0; s < seg_count; s++)
-        total_data_bytes += segs[s].length;
-
-    Serial.printf("  Segments: %d, total data payload: %lu bytes\n",
-                  seg_count, (unsigned long)total_data_bytes);
-    Serial.printf("  Exec address: $%04X\n", exec_addr);
-
-    // --- Step 5: Compare each LOADM segment data vs CoCo RAM ---
-    Serial.println("\n--- CoCo RAM Verification ---");
-    Serial.println("  (Comparing LOADM data payload vs CoCo RAM at load addresses)");
-    dump_screen_text();
-
-    bool all_pass = true;
-    int total_matches = 0;
-    int total_mismatches = 0;
-
-    for (int s = 0; s < seg_count; s++) {
-        uint16_t addr = segs[s].addr;
-        uint16_t len  = segs[s].length;
-        uint32_t foff = segs[s].file_off;  // offset past the 5-byte header
-
-        Serial.printf("\n  Segment %d: load addr=$%04X, length=%d, file_offset=%d\n",
-                      s, addr, len, (int)foff);
-        Serial.printf("  Header skipped: bytes 0-%d (type=$%02X size=$%04X addr=$%04X)\n",
-                      (int)(foff - 1), file_data[foff - 5],
-                      (uint16_t)((file_data[foff - 4] << 8) | file_data[foff - 3]),
-                      (uint16_t)((file_data[foff - 2] << 8) | file_data[foff - 1]));
-
-        if (addr + len > 0x8000) {
-            Serial.printf("  [seg%d] $%04X+%d overlaps ROM area, skipping\n", s, addr, len);
-            continue;
-        }
-
-        int seg_matches = 0, seg_mismatches = 0;
-        int first_mismatch = -1;
-
-        for (int i = 0; i < len; i++) {
-            uint8_t expected = file_data[foff + i];
-            uint8_t actual   = machine->ram[addr + i];
-            if (expected == actual) {
-                seg_matches++;
-            } else {
-                if (seg_mismatches < 16) {
-                    Serial.printf("    MISMATCH @$%04X: expected=$%02X got=$%02X (file+%d)\n",
-                                  addr + i, expected, actual, (int)(foff + i));
-                }
-                if (first_mismatch < 0) first_mismatch = i;
-                seg_mismatches++;
-            }
-        }
-
-        Serial.printf("  [seg%d] CoCo addr $%04X-%04X: %d match, %d mismatch out of %d bytes\n",
-                      s, addr, addr + len - 1, seg_matches, seg_mismatches, len);
-
-        total_matches += seg_matches;
-        total_mismatches += seg_mismatches;
-
-        if (seg_mismatches > 0) {
-            all_pass = false;
-
-            // Hex dump around first mismatch
-            if (first_mismatch >= 0) {
-                int dstart = (first_mismatch > 16) ? first_mismatch - 16 : 0;
-                int dend = first_mismatch + 32;
-                if (dend > len) dend = len;
-
-                Serial.printf("    Expected (file offset %d):\n    ", (int)(foff + dstart));
-                for (int i = dstart; i < dend; i++)
-                    Serial.printf("%02X ", file_data[foff + i]);
-                Serial.println();
-
-                Serial.printf("    Actual   (RAM $%04X):\n    ", addr + dstart);
-                for (int i = dstart; i < dend; i++)
-                    Serial.printf("%02X ", machine->ram[addr + i]);
-                Serial.println();
-            }
-        }
-    }
-
-    // --- Summary ---
-    Serial.println("\n========================================");
-    Serial.printf("  TOTAL: %d match + %d mismatch = %d bytes checked\n",
-                  total_matches, total_mismatches, total_matches + total_mismatches);
-    if (all_pass) {
-        Serial.printf("  RESULT: PASS — all %d bytes verified OK\n", total_matches);
-    } else {
-        Serial.printf("  RESULT: FAIL — %d mismatches found\n", total_mismatches);
-    }
-    Serial.println("========================================\n");
-
-    if (sd_data) free(sd_data);
-    if (disk_data) free(disk_data);
-
-    return all_pass;
+    inject_keystrokes("PRINT \"HELLO WORLD\"\n");
+    bool ok = wait_for_screen_text("HELLO WORLD", 180);
+    Serial.printf("  [%s] HELLO WORLD on screen\n", ok ? "PASS" : "FAIL");
+    if (!ok) dump_screen_text();
+    return ok;
 }
 
 // ============================================================================
-// Run all (dispatches single verify)
+// Test: BASIC Red Circle
+// Draws a circle using PMODE 3 (128x96 4-color).
+// CSS=0 color 3 = red. CIRCLE(128,96) is center of the logical 256x192 plane.
+// Verification: after PCLS 0 zeros the buffer, any non-zero byte in the
+// PMODE 3 page-1 graphics buffer ($1800-$23FF) confirms pixels were drawn.
+// ============================================================================
+
+bool IntegrationTest::test_basic_circle() {
+    Serial.println("\n--- Test: BASIC Red Circle ---");
+    if (!ensure_booted()) {
+        Serial.println("  [FAIL] Could not boot to BASIC prompt");
+        return false;
+    }
+    inject_keystrokes("10 PMODE 3,1:PCLS 0:SCREEN 1,0:CIRCLE(128,96),40,3\n");
+    drain_key_queue(30);
+    inject_keystrokes("20 FOR T=1 TO 500:NEXT T\n");
+    drain_key_queue(30);
+    inject_keystrokes("RUN\n");
+    // drain typing + run 1800 frames (~30 s at 60 fps) for CIRCLE + FOR loop
+    drain_key_queue(1800);
+
+    // Scan PMODE 3 page-1 buffer ($1800-$23FF, 3072 bytes)
+    bool found = false;
+    for (uint16_t a = 0x1800; a <= 0x23FF; a++) {
+        if (machine->ram[a] != 0x00) { found = true; break; }
+    }
+    Serial.printf("  [%s] Graphics pixels in PMODE buffer $1800-$23FF\n",
+                  found ? "PASS" : "FAIL");
+    if (!found) {
+        // Dump first 32 bytes of the expected buffer for diagnosis
+        Serial.print("  Buffer[$1800]: ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02X ", machine->ram[0x1800 + i]);
+        Serial.println();
+    }
+    return found;
+}
+
+// ============================================================================
+// Run all
 // ============================================================================
 
 void IntegrationTest::run_all(bool stop_on_failure) {
@@ -814,13 +386,19 @@ void IntegrationTest::run_all(bool stop_on_failure) {
     fail_count = 0;
     result_count = 0;
 
-    uint32_t sm = millis();
-    bool p = test_loadm_verify("ZAXXON.BIN", 1);
-    uint32_t em = millis() - sm;
+    struct { const char* name; bool (IntegrationTest::*fn)(); } tests[] = {
+        { "BASIC Hello World", &IntegrationTest::test_basic_hello_world },
+        { "BASIC Red Circle",  &IntegrationTest::test_basic_circle      },
+    };
 
-    record("LOADM ZAXXON.BIN", p, 0, em);
-
-    Serial.printf("=== %s (%u ms) ===\n", p ? "PASS" : "FAIL", em);
+    for (auto& t : tests) {
+        uint32_t sm = millis();
+        bool p = (this->*t.fn)();
+        uint32_t em = millis() - sm;
+        record(t.name, p, 0, em);
+        Serial.printf("  %s — %s (%u ms)\n", t.name, p ? "PASS" : "FAIL", em);
+        if (!p && stop_on_failure) break;
+    }
 }
 
 // ============================================================================
@@ -867,16 +445,4 @@ void IntegrationTest::process_serial_command(char cmd) {
     }
 }
 
-/* ==========================================================================
- * Commented-out old tests (kept for reference):
- *
- * bool IntegrationTest::test_boot_sequence()   — boot to OK prompt
- * bool IntegrationTest::test_basic_print()     — PRINT "ABCDEFGH"
- * bool IntegrationTest::test_basic_for_loop()  — FOR I=1 TO 10
- * bool IntegrationTest::test_graphics_pmode4() — PMODE 3 page flip
- * bool IntegrationTest::test_sound_output()    — SOUND 100,10
- *
- * These were in the original integration_test.cpp and can be restored
- * by uncommenting their declarations in integration_test.h and re-adding
- * the implementations from git history.
- * ========================================================================== */
+#endif // DISK_ENABLED

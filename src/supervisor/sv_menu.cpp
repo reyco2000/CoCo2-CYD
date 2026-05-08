@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_menu.cpp
  *  Module : Supervisor OSD main menu — disk/drive options, reset, and settings
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -137,8 +137,38 @@ void sv_menu_on_key(Supervisor_t* sv, uint8_t hid_usage, bool pressed) {
     }
 }
 
+void sv_menu_on_touch(Supervisor_t* sv, uint16_t x, uint16_t y) {
+    // Tap title bar to close the supervisor overlay
+    if ((int)y >= SV_BORDER_Y && (int)y < SV_BORDER_Y + SV_TITLE_H) {
+        supervisor_toggle();
+        return;
+    }
+    if (x < SV_BORDER_X || x >= SV_BORDER_X + SV_BORDER_W) return;
+
+    int content_rows = (SV_BORDER_H - SV_TITLE_H - SV_FOOTER_H - 8) / SV_ITEM_H;
+    int offset = (content_rows - sv->menu_item_count) / 2;
+    if (offset < 0) offset = 0;
+
+    for (int i = 0; i < sv->menu_item_count; i++) {
+        int row_y = SV_CONTENT_Y + (i + offset) * SV_ITEM_H;
+        if ((int)y >= row_y && (int)y < row_y + SV_ITEM_H) {
+            if (sv->touch_armed_row == i) {
+                // Second tap on the same item → execute
+                sv->touch_armed_row = -1;
+                execute_action(sv, menu_items[i].action);
+            } else {
+                // First tap (or moving to a new row) → arm and highlight
+                sv->touch_armed_row = i;
+                sv->menu_cursor = i;
+                sv->needs_redraw = true;
+            }
+            return;
+        }
+    }
+}
+
 void sv_menu_render(Supervisor_t* sv) {
-    sv_render_frame("*CoCo ESP32 SUPERVISOR*", "Up/Dn -  ENTER - F1/ESC");
+    sv_render_frame("*CoCo ESP32 SUPERVISOR*", "Tap to select, again to confirm");
 
     // Vertically center: content area fits ~8 rows, offset to center items
     int content_rows = (SV_BORDER_H - SV_TITLE_H - SV_FOOTER_H - 8) / SV_ITEM_H;

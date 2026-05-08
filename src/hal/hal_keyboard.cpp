@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal_keyboard.cpp
  *  Module : Keyboard HAL — USB HID host events mapped to CoCo 7×8 matrix
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -40,6 +40,93 @@
 #include "usb_kbd_host.h"
 #include "../supervisor/supervisor.h"
 #include "../supervisor/sv_disk.h"
+
+#if TOUCH_KB_ENABLED
+#include "CoCo2Keyboard.h"  // brings in TFT_eSPI.h
+#include "hal_touch_cal.h"
+
+extern TFT_eSPI* hal_video_get_tft(void);
+
+// Software SPI bit-bang for XPT2046 — leaves HSPI free for SD card.
+// Hardware SPIClass(HSPI) for touch overwrites SD card HSPI pin mapping
+// on first begin() call, breaking all subsequent SD reads.
+static void xpt2046_init() {
+    pinMode(PIN_TOUCH_CS,   OUTPUT); digitalWrite(PIN_TOUCH_CS,   HIGH);
+    pinMode(PIN_TOUCH_SCLK, OUTPUT); digitalWrite(PIN_TOUCH_SCLK, LOW);
+    pinMode(PIN_TOUCH_MOSI, OUTPUT); digitalWrite(PIN_TOUCH_MOSI, LOW);
+    pinMode(PIN_TOUCH_MISO, INPUT);
+    pinMode(PIN_TOUCH_IRQ,  INPUT);
+}
+
+static void xpt2046_write_byte(uint8_t b) {
+    for (int i = 7; i >= 0; i--) {
+        digitalWrite(PIN_TOUCH_MOSI, (b >> i) & 1);
+        digitalWrite(PIN_TOUCH_SCLK, HIGH);
+        digitalWrite(PIN_TOUCH_SCLK, LOW);
+    }
+}
+
+static uint16_t xpt2046_read16() {
+    uint16_t r = 0;
+    for (int i = 15; i >= 0; i--) {
+        digitalWrite(PIN_TOUCH_SCLK, HIGH);
+        if (digitalRead(PIN_TOUCH_MISO)) r |= (1u << i);
+        digitalWrite(PIN_TOUCH_SCLK, LOW);
+    }
+    return r >> 3;  // 12-bit value sits in bits 14:3
+}
+
+static uint16_t xpt2046_read_channel(uint8_t cmd) {
+    xpt2046_write_byte(cmd);
+    delayMicroseconds(10);  // wait for ADC conversion (~6 us at 2 MHz)
+    return xpt2046_read16();
+}
+
+static bool xpt2046_read_xy(uint16_t* out_x, uint16_t* out_y) {
+    if (digitalRead(PIN_TOUCH_IRQ) != LOW) return false;
+    digitalWrite(PIN_TOUCH_CS, LOW);
+    uint32_t sx = 0, sy = 0;
+    for (int i = 0; i < 3; i++) {
+        sx += xpt2046_read_channel(0xD0);  // X+ channel
+        sy += xpt2046_read_channel(0x90);  // Y+ channel
+    }
+    digitalWrite(PIN_TOUCH_CS, HIGH);
+    *out_x = (uint16_t)(sx / 3);
+    *out_y = (uint16_t)(sy / 3);
+    return true;
+}
+
+static uint16_t s_touch_x_min = TOUCH_X_MIN;
+static uint16_t s_touch_x_max = TOUCH_X_MAX;
+static uint16_t s_touch_y_min = TOUCH_Y_MIN;
+static uint16_t s_touch_y_max = TOUCH_Y_MAX;
+
+static CoCo2Keyboard*       s_osk             = nullptr;
+static bool                 s_osk_initialized = false;
+static bool                 s_osk_was_visible = false;
+static bool                 s_prev_touched    = false;
+#endif
+
+bool hal_keyboard_read_raw_xy(uint16_t* out_x, uint16_t* out_y) {
+#if TOUCH_KB_ENABLED
+    return xpt2046_read_xy(out_x, out_y);
+#else
+    (void)out_x; (void)out_y;
+    return false;
+#endif
+}
+
+void hal_keyboard_set_touch_cal(uint16_t x_min, uint16_t x_max,
+                                 uint16_t y_min, uint16_t y_max) {
+#if TOUCH_KB_ENABLED
+    s_touch_x_min = x_min;
+    s_touch_x_max = x_max;
+    s_touch_y_min = y_min;
+    s_touch_y_max = y_max;
+#else
+    (void)x_min; (void)x_max; (void)y_min; (void)y_max;
+#endif
+}
 
 // ── USB HID modifier bitmasks ───────────────────────────────────────────────
 #define MOD_LSHIFT  0x02
@@ -186,7 +273,7 @@ struct DeferredRelease {
 static DeferredRelease deferred_releases[MAX_DEFERRED];
 
 static void defer_release(uint8_t col, uint8_t row) {
-    // If there's already a deferred release for this key, refresh it
+    // If there is already a deferred release for this key, refresh it
     for (int i = 0; i < MAX_DEFERRED; i++) {
         if (deferred_releases[i].frames_left > 0 &&
             deferred_releases[i].col == col && deferred_releases[i].row == row) {
@@ -303,11 +390,26 @@ static void on_hid_key(uint8_t usage, uint8_t modifiers, bool pressed) {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+#if TOUCH_KB_ENABLED
+static void _osk_dispatch_fn(uint8_t ascii) {
+    switch (ascii) {
+        case 0xF1: supervisor_toggle(); break;
+        case 0xF2:
+            if (s_machine_ptr) {
+                sv_disk_flush_all(&s_machine_ptr->fdc);
+                machine_reset(s_machine_ptr);
+            }
+            break;
+        case 0xF5: hal_video_toggle_fps_overlay(); break;
+    }
+}
+#endif
+
 void hal_keyboard_init(void) {
     hal_keyboard_release_all();
     memset(deferred_releases, 0, sizeof(deferred_releases));
-    hid_host_begin(on_hid_key);
-    DEBUG_PRINT("  Keyboard: USB HID host + matrix injection ready");
+    hid_host_begin(on_hid_key);  // no-op when USE_USB_HOST=0
+    DEBUG_PRINT("  Keyboard: matrix ready (touch OSK pending video init)");
 }
 
 void hal_keyboard_tick(void) {
@@ -338,4 +440,92 @@ void hal_keyboard_release_all(void) {
     for (int i = 0; i < 8; i++) {
         key_matrix[i] = 0xFF;
     }
+}
+
+// ── OSK touch update (call once per frame from hal_process_input) ────────────
+
+void hal_keyboard_update_touch(void) {
+#if TOUCH_KB_ENABLED
+    // Lazy init: deferred because hal_video_init() runs after hal_keyboard_init()
+    if (!s_osk_initialized) {
+        TFT_eSPI* t = hal_video_get_tft();
+        if (!t) return;  // video not ready yet
+        xpt2046_init();        // software SPI — HSPI stays free for SD card
+        touch_cal_load_nvs();  // load NVS calibration; also inits BOOT button (GPIO0)
+        s_osk = new CoCo2Keyboard();
+        s_osk->begin(t);
+        s_osk_initialized = true;
+        DEBUG_PRINTF("  Keyboard: XPT2046 touch (soft-SPI) + OSK ready, free_heap=%d",
+                     ESP.getFreeHeap());
+    }
+
+    uint16_t tx = 0, ty = 0;
+    bool touched = false;
+    uint16_t raw_x = 0, raw_y = 0;
+    if (xpt2046_read_xy(&raw_x, &raw_y)) {
+        // raw_x (0xD0) tracks vertical axis; raw_y (0x90) tracks horizontal axis
+        tx = (uint16_t)constrain(map(raw_y, s_touch_x_min, s_touch_x_max, 0, 319), 0, 319);
+        ty = (uint16_t)constrain(map(raw_x, s_touch_y_min, s_touch_y_max, 0, 239), 0, 239);
+        touched = true;
+    }
+
+    bool pressed = touched && !s_prev_touched;
+    s_prev_touched = touched;
+
+    if (supervisor_is_active()) {
+        if (pressed) {
+            // F1 hotzone tap closes supervisor even while OSD is showing
+            if (tx >= (uint16_t)(COCO_KB_BTN_F1_X - 2) &&
+                tx <  (uint16_t)(COCO_KB_BTN_F1_X + COCO_KB_FNBTN_W + 2) &&
+                ty <  (uint16_t)(COCO_KB_FNBTN_Y + COCO_KB_FNBTN_H + 8)) {
+                supervisor_toggle();
+            } else {
+                supervisor_on_touch(tx, ty, true);
+            }
+        }
+        return;
+    }
+
+    bool was_visible = s_osk->isVisible();
+    s_osk->update(tx, ty, touched);
+
+    while (s_osk->hasKey()) {
+        CoCoKeyEvent evt = s_osk->getKey();
+        if (evt.row == 7) {
+            _osk_dispatch_fn(evt.ascii);
+        } else {
+            if (evt.shifted) {
+                set_key(COCO_SHIFT_COL, COCO_SHIFT_ROW, true);
+                defer_release(COCO_SHIFT_COL, COCO_SHIFT_ROW);
+            }
+            set_key(evt.col, evt.row, true);
+            defer_release(evt.col, evt.row);
+        }
+    }
+
+    if (was_visible && !s_osk->isVisible()) {
+        hal_video_force_repaint();
+    }
+    s_osk_was_visible = s_osk->isVisible();
+#endif
+}
+
+bool hal_keyboard_osk_visible(void) {
+#if TOUCH_KB_ENABLED
+    return s_osk_was_visible;
+#else
+    return false;
+#endif
+}
+
+void hal_keyboard_draw_overlay(void) {
+#if TOUCH_KB_ENABLED
+    if (s_osk_initialized && s_osk) s_osk->drawHotZoneIndicator();
+#endif
+}
+
+void hal_keyboard_invalidate_hotzone(void) {
+#if TOUCH_KB_ENABLED
+    if (s_osk_initialized && s_osk) s_osk->invalidateHotzone();
+#endif
 }

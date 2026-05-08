@@ -1,25 +1,26 @@
+#include "../../config.h"
+#if DISK_ENABLED
+
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : sv_disk.cpp
  *  Module : WD1793-compatible FDC emulation — PSRAM disk cache with INTRQ/NMI/HALT mechanism
- * ============================================================
+ * =============================================================
  */
 
 /*
  * sv_disk.cpp - Virtual floppy disk controller (WD1793-compatible)
  *
  * Command-level FDC emulation with INTRQ tracking.
- * Entire disk images are cached in PSRAM at mount time — all sector
- * reads/writes go to the in-memory cache, eliminating SD card timing
- * issues during emulation.  Dirty images are flushed back to SD on
- * eject or explicit flush.
+ * Sectors are read and written directly from the SD card file via
+ * seek()+read()/write() — no full-image cache needed.
  *
  * DSKCON sequence: issue command → enable NMI in DSKREG → wait for NMI.
  * INTRQ is latched when a command completes. NMI fires when BOTH
@@ -29,13 +30,11 @@
  * CRITICAL NOTES:
  * - Sectors are 1-based (1-18), NOT 0-based
  * - NMI fires via INTRQ + DSKREG NMI enable, NOT immediately
- * - Disk images cached in PSRAM (~161KB each, up to 4 drives)
  */
 
 #include "sv_disk.h"
 #include "../utils/debug.h"
 #include <SD.h>
-#include <esp_heap_caps.h>
 
 // WRITE TRACK state machine constants
 #define WT_IDLE        0
@@ -93,16 +92,42 @@ static void set_drq(SV_DiskController* fdc, bool value) {
     }
 }
 
-// Calculate byte offset into disk data for given track/sector
-// Returns offset relative to start of data (after header), or UINT32_MAX on error
+static uint32_t disk_data_size(const SV_DiskImage* img) {
+    return (uint32_t)img->tracks * img->sides
+         * img->sectors_per_track * img->sector_size;
+}
+
+// Returns byte offset into image data (after header), or UINT32_MAX on error.
+// Sectors are 1-based (CoCo BASIC uses 1-18).
 static uint32_t sector_offset(SV_DiskImage* img, uint8_t track, uint8_t sector) {
-    // CoCo BASIC uses sectors 1-18 (1-based!)
     if (sector < 1 || sector > img->sectors_per_track) return UINT32_MAX;
     if (track >= img->tracks) return UINT32_MAX;
 
     uint32_t offset = (uint32_t)track * img->sectors_per_track * img->sector_size;
     offset += (uint32_t)(sector - 1) * img->sector_size;
+
+    if (offset + img->sector_size > disk_data_size(img)) return UINT32_MAX;
     return offset;
+}
+
+static bool disk_read_sector(SV_DiskImage* img, uint8_t track, uint8_t sector, uint8_t* dst) {
+    uint32_t off = sector_offset(img, track, sector);
+    if (off == UINT32_MAX) return false;
+    if (!img->file.seek(img->header_size + off)) return false;
+    int got = img->file.read(dst, img->sector_size);
+    return got == (int)img->sector_size;
+}
+
+static bool disk_write_sector(SV_DiskImage* img, uint8_t track, uint8_t sector,
+                              const uint8_t* src, bool flush_now) {
+    if (img->read_only) return false;
+    uint32_t off = sector_offset(img, track, sector);
+    if (off == UINT32_MAX) return false;
+    if (!img->file.seek(img->header_size + off)) return false;
+    size_t wrote = img->file.write(src, img->sector_size);
+    if (wrote != img->sector_size) return false;
+    if (flush_now) img->file.flush();
+    return true;
 }
 
 // Execute FDC command
@@ -138,21 +163,18 @@ static void fdc_execute_command(SV_DiskController* fdc, uint8_t cmd) {
             break;
 
         case 0x80: case 0x90:  // READ SECTOR
-            if (!disk->mounted || !disk->cache) {
+            if (!disk->mounted || !disk->file) {
                 fdc->status = 0x80;  // NOT READY
                 fdc->busy = false;
                 break;
             }
             {
-                uint32_t off = sector_offset(disk, fdc->track, fdc->sector);
-                if (off == UINT32_MAX || (off + disk->sector_size) > disk->cache_size) {
+                if (!disk_read_sector(disk, fdc->track, fdc->sector, fdc->sector_buf)) {
+                    memset(fdc->sector_buf, 0, sizeof(fdc->sector_buf));
                     fdc->status = 0x10;  // RECORD NOT FOUND
                     fdc->busy = false;
                     break;
                 }
-
-                // Copy sector from PSRAM cache — instant, no SD access
-                memcpy(fdc->sector_buf, disk->cache + off, disk->sector_size);
 
                 fdc->buf_pos = 0;
                 fdc->buf_len = disk->sector_size;
@@ -164,7 +186,7 @@ static void fdc_execute_command(SV_DiskController* fdc, uint8_t cmd) {
             break;
 
         case 0xA0: case 0xB0:  // WRITE SECTOR
-            if (!disk->mounted || !disk->cache) {
+            if (!disk->mounted || !disk->file) {
                 fdc->status = 0x80;
                 fdc->busy = false;
                 break;
@@ -187,7 +209,7 @@ static void fdc_execute_command(SV_DiskController* fdc, uint8_t cmd) {
             break;
 
         case 0xF0:  // WRITE TRACK (format)
-            if (!disk->mounted || !disk->cache) {
+            if (!disk->mounted || !disk->file) {
                 fdc->status = 0x80;
                 fdc->busy = false;
                 break;
@@ -348,13 +370,9 @@ static void fdc_write_track_byte(SV_DiskController* fdc, uint8_t value) {
             fdc->sector_buf[fdc->wt_data_pos] = value;
             fdc->wt_data_pos++;
             if (fdc->wt_data_pos >= disk->sector_size) {
-                // Full sector received — write to PSRAM cache
-                uint32_t off = sector_offset(disk, fdc->track, fdc->wt_id_sector);
-                if (off != UINT32_MAX && disk->cache &&
-                    (off + disk->sector_size) <= disk->cache_size) {
-                    memcpy(disk->cache + off, fdc->sector_buf, disk->sector_size);
-                    disk->dirty = true;
-                }
+                bool ok = disk_write_sector(disk, fdc->track, fdc->wt_id_sector,
+                                           fdc->sector_buf, false);
+                if (!ok) fdc->status = 0x20;  // WRITE FAULT
                 fdc->wt_state = WT_IDLE;
             }
             break;
@@ -364,11 +382,13 @@ static void fdc_write_track_byte(SV_DiskController* fdc, uint8_t value) {
 check_done:
     // Track complete after enough bytes received
     if (fdc->wt_byte_count >= WT_TRACK_BYTES) {
+        SV_DiskImage* disk = &fdc->drives[fdc->drive_select];
+        if (disk->file) disk->file.flush();
         fdc->write_track = false;
         fdc->drq = false;
         fdc->busy = false;
         fdc->status = 0x00;
-        set_intrq(fdc, true);  // Fire NMI immediately (see read path comment)
+        set_intrq(fdc, true);
         return;
     }
 
@@ -389,18 +409,12 @@ static void fdc_write_data(SV_DiskController* fdc, uint8_t value) {
         fdc->buf_pos++;
 
         if (fdc->buf_pos >= fdc->buf_len) {
-            // All bytes received — write to PSRAM cache (instant, no SD)
             SV_DiskImage* disk = &fdc->drives[fdc->drive_select];
-            uint32_t off = sector_offset(disk, fdc->track, fdc->sector);
-            if (off != UINT32_MAX && disk->cache &&
-                (off + disk->sector_size) <= disk->cache_size) {
-                memcpy(disk->cache + off, fdc->sector_buf, disk->sector_size);
-                disk->dirty = true;
-            }
+            bool ok = disk_write_sector(disk, fdc->track, fdc->sector, fdc->sector_buf, true);
             fdc->writing = false;
             fdc->drq = false;
             fdc->busy = false;
-            fdc->status = (off == UINT32_MAX) ? 0x10 : 0x00;
+            fdc->status = ok ? 0x00 : 0x20;  // WRITE FAULT on failure
             set_intrq(fdc, true);
         } else {
             fdc->drq = true;
@@ -456,8 +470,7 @@ void sv_disk_init(SV_DiskController* fdc) {
     for (int i = 0; i < SV_DISK_MAX_DRIVES; i++) {
         fdc->drives[i].mounted = false;
         fdc->drives[i].dirty = false;
-        fdc->drives[i].cache = nullptr;
-        fdc->drives[i].cache_size = 0;
+        fdc->drives[i].data_size = 0;
         fdc->drives[i].sectors_per_track = DISK_SECTORS;
         fdc->drives[i].sector_size = DISK_SECTOR_SIZE;
         fdc->drives[i].tracks = DISK_TRACKS;
@@ -600,22 +613,26 @@ bool sv_disk_mount(SV_DiskController* fdc, uint8_t drive, const char* path) {
 
     SV_DiskImage* img = &fdc->drives[drive];
 
-    // Eject any currently mounted image
     if (img->mounted) {
         sv_disk_eject(fdc, drive);
     }
 
-    // Open file to read image
-    img->file = SD.open(path, FILE_READ);
+    // Try read-write first so writes go in-place without truncation
+    img->file = SD.open(path, "r+");
     if (!img->file) {
-        DEBUG_PRINTF("FDC: Failed to open %s", path);
-        return false;
+        img->file = SD.open(path, FILE_READ);
+        if (!img->file) {
+            DEBUG_PRINTF("FDC: Failed to open %s", path);
+            return false;
+        }
+        img->read_only = true;
+    } else {
+        img->read_only = false;
     }
 
     strncpy(img->path, path, sizeof(img->path) - 1);
     img->path[sizeof(img->path) - 1] = '\0';
     img->image_size = img->file.size();
-    img->read_only = false;
     img->dirty = false;
 
     if (!sv_disk_detect_geometry(img)) {
@@ -624,65 +641,13 @@ bool sv_disk_mount(SV_DiskController* fdc, uint8_t drive, const char* path) {
         return false;
     }
 
-    // Calculate data size (image minus header)
-    img->cache_size = (uint32_t)img->tracks * img->sectors_per_track * img->sector_size;
-    if (img->sides == 2) img->cache_size *= 2;
-
-    // Allocate PSRAM cache for entire disk image
-    img->cache = (uint8_t*)heap_caps_malloc(img->cache_size, MALLOC_CAP_SPIRAM);
-    if (!img->cache) {
-        // Fall back to regular heap if PSRAM full
-        img->cache = (uint8_t*)malloc(img->cache_size);
-    }
-    if (!img->cache) {
-        DEBUG_PRINTF("FDC: Failed to allocate %lu bytes for disk cache", img->cache_size);
-        img->file.close();
-        return false;
-    }
-
-    // Load entire disk image into PSRAM cache.
-    // IMPORTANT: ESP32 SPI DMA cannot reliably write directly to PSRAM,
-    // so we read into a small internal-RAM bounce buffer first, then
-    // memcpy to the PSRAM cache.
-    if (img->header_size > 0) {
-        img->file.seek(img->header_size);
-    }
-
-    // Bounce buffer in internal RAM (DMA-safe)
-    const size_t BOUNCE_SIZE = 512;
-    uint8_t bounce[BOUNCE_SIZE];
-
-    size_t total_read = 0;
-    size_t remaining = img->cache_size;
-    while (remaining > 0) {
-        size_t chunk = (remaining > BOUNCE_SIZE) ? BOUNCE_SIZE : remaining;
-        int got = img->file.read(bounce, chunk);
-        if (got <= 0) {
-            DEBUG_PRINTF("FDC: Read stalled at %lu/%lu bytes", total_read, img->cache_size);
-            memset(img->cache + total_read, 0, remaining);
-            break;
-        }
-        memcpy(img->cache + total_read, bounce, got);
-        total_read += got;
-        remaining -= got;
-    }
-    DEBUG_PRINTF("FDC: Loaded %lu/%lu bytes into cache", total_read, img->cache_size);
-
-    // Close read-only handle, reopen as r+ for write-back
-    img->file.close();
-    img->file = SD.open(path, "r+");
-    if (!img->file) {
-        // Fall back to read-only (can't write back)
-        img->file = SD.open(path, FILE_READ);
-        img->read_only = true;
-    }
-
+    img->data_size = disk_data_size(img);
     img->mounted = true;
-    DEBUG_PRINTF("FDC: Mounted drive %d: %s (%dT/%dS/%dB, %lu bytes cached in %s)",
+
+    DEBUG_PRINTF("FDC: Mounted drive %d: %s (%dT/%dS/%dB, %lu bytes, %s)",
                  drive, path, img->tracks, img->sectors_per_track,
-                 img->sector_size, img->cache_size,
-                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0 ? "PSRAM" : "heap");
-    DEBUG_PRINTF("FDC: Free PSRAM: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                 img->sector_size, img->data_size,
+                 img->read_only ? "read-only" : "read-write");
 
     return true;
 }
@@ -693,19 +658,7 @@ void sv_disk_eject(SV_DiskController* fdc, uint8_t drive) {
     SV_DiskImage* img = &fdc->drives[drive];
     if (!img->mounted) return;
 
-    // Flush dirty cache back to SD before ejecting
-    if (img->dirty && img->cache && img->file) {
-        sv_disk_flush(fdc, drive);
-    }
-
-    img->file.close();
-
-    // Free PSRAM cache
-    if (img->cache) {
-        free(img->cache);
-        img->cache = nullptr;
-        img->cache_size = 0;
-    }
+    if (img->file) img->file.close();
 
     img->mounted = false;
     img->dirty = false;
@@ -727,32 +680,9 @@ const char* sv_disk_get_path(SV_DiskController* fdc, uint8_t drive) {
 void sv_disk_flush(SV_DiskController* fdc, uint8_t drive) {
     if (drive >= SV_DISK_MAX_DRIVES) return;
     SV_DiskImage* img = &fdc->drives[drive];
-    if (!img->mounted || !img->dirty || !img->cache) return;
-    if (img->read_only || !img->file) return;
-
-    // Write cache back to SD file using bounce buffer (PSRAM→DMA safe)
-    DEBUG_PRINTF("FDC: Flushing drive %d (%lu bytes) to SD...", drive, img->cache_size);
-    img->file.seek(img->header_size);
-
-    const size_t BOUNCE_SIZE = 512;
-    uint8_t bounce[BOUNCE_SIZE];
-
-    size_t total_written = 0;
-    size_t remaining = img->cache_size;
-    while (remaining > 0) {
-        size_t chunk = (remaining > BOUNCE_SIZE) ? BOUNCE_SIZE : remaining;
-        memcpy(bounce, img->cache + total_written, chunk);
-        size_t wrote = img->file.write(bounce, chunk);
-        if (wrote == 0) {
-            DEBUG_PRINTF("FDC: Write stalled at %lu/%lu bytes", total_written, img->cache_size);
-            break;
-        }
-        total_written += wrote;
-        remaining -= wrote;
-    }
+    if (!img->mounted || img->read_only || !img->file) return;
     img->file.flush();
     img->dirty = false;
-    DEBUG_PRINTF("FDC: Flush complete (%lu bytes written)", total_written);
 }
 
 void sv_disk_flush_all(SV_DiskController* fdc) {
@@ -760,3 +690,13 @@ void sv_disk_flush_all(SV_DiskController* fdc) {
         sv_disk_flush(fdc, i);
     }
 }
+
+bool sv_disk_read_sector_raw(SV_DiskController* fdc, uint8_t drive,
+                             uint8_t track, uint8_t sector, uint8_t* dst) {
+    if (drive >= SV_DISK_MAX_DRIVES) return false;
+    SV_DiskImage* img = &fdc->drives[drive];
+    if (!img->mounted || !img->file) return false;
+    return disk_read_sector(img, track, sector, dst);
+}
+
+#endif // DISK_ENABLED

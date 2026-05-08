@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : hal_storage.cpp
  *  Module : Storage HAL — SD card access via dedicated SPI bus
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -214,4 +214,3 @@ bool hal_storage_file_exists(const char* path) {
     DEBUG_PRINTF("  Storage: file_exists('%s') = %s", path, exists ? "yes" : "no");
     return exists;
 }
-

@@ -1,326 +1,380 @@
-# ESP32_CoCo2_XRoar_Port — Color Computer 2 Emulator for ESP32-S3
+# CoCo2-CYD — TRS-80 Color Computer 2 Emulator for ESP CYD
 
-A full **TRS-80 Color Computer 2 (CoCo 2)** emulator running on an ESP32-S3 microcontroller. Ported from the [XRoar](http://www.6809.org.uk/xroar/) emulator by Ciaran Anscomb.
+A full **TRS-80 Color Computer 2 (CoCo 2)** emulator running on the **ESP CYD** (Cheap Yellow Display — ESP32-2432S028R). Ported from the [XRoar](http://www.6809.org.uk/xroar/) emulator by Ciaran Anscomb.
 
-**Beta-1 — March 2026**
+**Beta-1 — 2026**
+
+---
 
 ## Features
 
-- **Complete MC6809 CPU** emulation with accurate cycle counts
-- **MC6847 VDG** video display — text and all semigraphics/graphics modes
-- **Dual 6821 PIA** chips for keyboard, joystick, and audio I/O
-- **SAM6883** address multiplexer for memory mapping and video control
-- **WD1793 floppy disk controller** with .DSK and .VDK image support
-- **USB HID keyboard** input via ESP32-S3 native USB host
-- **Original CoCo Dual analog joysticks** with button support
-- **On-Screen Display (OSD)** supervisor for disk mounting, machine reset, and status
-- **PSRAM disk caching** — entire disk images loaded into PSRAM for zero-latency access
-- **Multiple display support** — ILI9341, ST7789, or ST7796 SPI TFT panels
-- **Audio output** via DAC or I2S
-- **64 KB RAM**, configurable to 16/32/64 KB
-- **25 FPS**, currently rendering 25 FPS on TFT display
+- **Complete MC6809 CPU** — all opcodes, accurate cycle counts, NMI/FIRQ/IRQ
+- **MC6847 VDG** — text mode and all 8 semigraphics/graphics modes
+- **Dual MC6821 PIA** — keyboard matrix, 60 Hz vsync IRQ, audio control
+- **SAM6883** address multiplexer — memory mapping and VDG counter
+- **WD1793 floppy disk controller** — `.DSK` (JVC) and `.VDK` formats via SD card
+- **On-Screen Display (OSD)** — disk browser, disk manager, machine reset
+- **Touchscreen keyboard** — full CoCo key layout via XPT2046 touch (built-in on CYD)
+- **Touch calibration** — 6-point calibration triggered by holding BOOT 5 s at power-on; saved to NVS
+- **Audio output** — 6-bit DAC + single-bit via GPIO26 (built-in buzzer/speaker)
+- **64 KB RAM** — full CoCo 2 configuration
+- **~25–27 FPS** active emulation; ~64 FPS text mode (VRAM shadow skips static frames)
 
-## Hardware Requirements
+---
 
-- **ESP32-S3-DevKitC-1** (dual-core, 8 MB PSRAM, USB OTG)
-- **SPI TFT Display** — ST7789 320x240 recommended (ILI9341 or ST7796 also supported)
-- **MicroSD card module** (SPI interface, FAT32 formatted)
-- **USB keyboard** (standard HID, connected via USB OTG port)
-- **Analog joysticks** (optional, two supported)
+## Target Hardware — ESP CYD (ESP32-2432S028R)
 
-## Wiring Diagram
+The **Cheap Yellow Display** is a self-contained ESP32 development board with a built-in 320×240 ILI9341 TFT, XPT2046 resistive touchscreen, SD card slot, and buzzer. No external wiring required.
 
-```
-                             ESP32-S3-DevKitC-1
-                          +----------------------+
-                          |      [ Antenna ]     |
-                          |  +----------------+  |
-  [To TFT VCC] <--- 3.3V -|  | ESP32-S3-WROOM |  |- GND
-                    3.3V -|  |                |  |- GPIO43
-                   RESET -|  +----------------+  |- GPIO44
-[To TFT RESET]<---GPIO04 -| 4                  1 |- GPIO01
- [To TFT LED] <---GPIO05 -| 5                  2 |- GPIO02 ---> [To TFT DC]
-                  GPIO06 -| 6                 42 |- GPIO42
- [To Joy2 Btn] <--GPIO07 -| 7                 41 |- GPIO41 ---> [To SD MISO]
-   [To Joy2 Y]<-- GPIO15 -| 15                40 |- GPIO40 ---> [To MOSI SD]
-   [To Joy2 X]<-- GPIO16 -| 16                39 |- GPIO39 ---> [To SD SCK]
-                  GPIO17 -| 17                38 |- GPIO38 ---> [To SD CS]
- [To Joy1 Btn] <--GPIO18 -| 18                37 |- GPIO37
-   [To Joy1 Y] <--GPIO08 -| 8                 36 |- GPIO36
-                   GPIO3 -| 3       [RGB]     35 |- GPIO35
-                  GPIO46 -| 46                 0 |- GPIO0  (BOOT)
-   [To Joy1 X] <--GPIO09 -| 9                 45 |- GPIO45
-   [To TFT CS] <--GPIO10 -| 10                48 |- GPIO48
-  [To TFT SDI] <--GPIO11 -| 11                47 |- GPIO47
-  [To TFT SCK] <--GPIO12 -| 12                21 |- GPIO21
-  [To SD MISO] <--GPIO13 -| 13                20 |- GPIO20
-    [To SD CS] <--GPIO14 -| 14                19 |- GPIO19
-                      5V -| 5V                 G |- GND
-  [To TFT GND] <---- GND -| G                  G |- GND
-                          |                      |
-                          |    BOOT      RESET   |
-                          |    [O]        [O]    |
-                          |                      |
-                          |   [UART]     [USB]   |
-                          +---|====|-----|====|--+
-                                            |
-                                     Connect USB Keyboard here
-(Due to power consumption I have used a USB Dongle keyboard that uses less power)
+| Component        | Built-in on CYD |
+|------------------|-----------------|
+| MCU              | ESP32 (dual-core, 240 MHz, no PSRAM) |
+| Display          | ILI9341 320×240 TFT (VSPI) |
+| Touchscreen      | XPT2046 resistive (software SPI) |
+| SD card          | Micro SD slot (separate SPI) |
+| Audio            | Passive buzzer on GPIO26 (ESP32 DAC) |
+| USB              | USB-UART only (no USB OTG) |
 
+### Pin Reference
 
-                TFT ST7789 Display                          SD Card Module
-             +----------------------+                  +----------------------+
-             |                      |                  |                      |
-             |  VCC   <--- [3.3V]   |                  |  VCC   <--- [3.3V]   |
-             |  GND   <--- [GND]    |                  |  GND   <--- [GND]    |
-             |  CS    <--- [GPIO10] |                  |  CS    <--- [GPIO38] |
-             |  RESET <--- [GPIO04] |                  |  SCK   <--- [GPIO39] |
-             |  DC    <--- [GPIO02] |                  |  MOSI  <--- [GPIO40] |
-             |  SDI   <--- [GPIO11] |                  |  MISO  <--- [GPIO41] |
-             |  SCK   <--- [GPIO12] |                  |                      |
-             |  LED   <--- [GPIO05] |                  |                      |
-             |  MISO (Not connected)|                  |     [ MicroSD ]      |
-             |                      |                  |                      |
-             |   [ LCD SCREEN ]     |                  |                      |
-             |                      |                  |                      |
-             +----------------------+                  +----------------------+
+| Function       | GPIO | Notes |
+|----------------|------|-------|
+| TFT CS         | 15   | ILI9341 SPI display |
+| TFT DC         | 2    | Data/Command |
+| TFT MOSI       | 13   | SPI data |
+| TFT SCLK       | 14   | SPI clock |
+| TFT MISO       | 12   | SPI read |
+| TFT Backlight  | 21   | Active HIGH |
+| SD CS          | 5    | Onboard SD slot (separate SPI bus) |
+| SD MOSI        | 23   | |
+| SD MISO        | 19   | |
+| SD SCLK        | 18   | |
+| Audio          | 26   | ESP32 built-in DAC |
+| Touch CS       | 33   | XPT2046 (software SPI) |
+| Touch MOSI     | 32   | |
+| Touch MISO     | 39   | |
+| Touch SCLK     | 25   | |
+| Touch IRQ      | 36   | |
 
-                  Joystick 1                                Joystick 2
-             +----------------------+                  +----------------------+
-             |                      |                  |                      |
-             |  X-Axis <--- [GPIO09]|                  |  X-Axis <--- [GPIO16]|
-             |  Y-Axis <--- [GPIO08]|                  |  Y-Axis <--- [GPIO15]|
-             |  Btn    <--- [GPIO18]|                  |  Btn    <--- [GPIO07]|
-             |                      |                  |                      |
-             +----------------------+                  +----------------------+
+> The TFT and SD card use **separate SPI buses** — no bus contention during emulation.
+
+---
+
+## Build Requirements
+
+### Tool — arduino-cli
+
+All compile and upload operations use **arduino-cli**. Install it from [arduino.cc/en/software/cli](https://arduino.cc/en/software/cli).
+
+Verify installation:
+
+```bash
+arduino-cli version
 ```
 
-## Pin Reference
+### Board package
 
-| Function      | Pin     | Notes                          |
-|---------------|---------|--------------------------------|
-| TFT CS        | GPIO10  | Display chip select            |
-| TFT DC        | GPIO02  | Data/Command                   |
-| TFT RST       | GPIO04  | Display reset                  |
-| TFT MOSI/SDI  | GPIO11  | SPI data                       |
-| TFT SCK       | GPIO12  | SPI clock                      |
-| TFT Backlight | GPIO05  | PWM backlight control          |
-| SD CS          | GPIO38  | SD card chip select            |
-| SD MOSI        | GPIO40  | SD SPI data out                |
-| SD MISO        | GPIO41  | SD SPI data in                 |
-| SD SCK         | GPIO39  | SD SPI clock                   |
-| Joystick 1 X   | GPIO09  | Analog axis                    |
-| Joystick 1 Y   | GPIO08  | Analog axis                    |
-| Joystick 1 Btn | GPIO18  | Digital button                 |
-| Joystick 2 X   | GPIO16  | Analog axis                    |
-| Joystick 2 Y   | GPIO15  | Analog axis                    |
-| Joystick 2 Btn | GPIO07  | Digital button                 |
-| Audio DAC      | GPIO17  | Analog audio output            |
-| USB D-/D+      | GPIO19/20 | Native USB OTG (keyboard)   |
+Install the ESP32 board package (tested with **3.3.3**):
 
-> The TFT and SD card use **separate SPI buses** (FSPI and HSPI) so there is no bus contention during emulation.
->
-> To be able to use USB port on the **ESP32S3 DEV board need to solder USB OTG in the back of devboard**, (https://danielmangum.com/posts/usb-otg-esp32s3/?_x_tr_sl=en&_x_tr_tl=es&_x_tr_hl=es&_x_tr_pto=tc)  
+```bash
+arduino-cli core update-index
+arduino-cli core install esp32:esp32
+```
+
+### Required Libraries
+
+Install via arduino-cli:
+
+```bash
+arduino-cli lib install "TFT_eSPI"
+arduino-cli lib install "SD"
+```
+
+> **TFT_eSPI** requires configuration — see [TFT_eSPI Setup](#tft_espi-setup) below.
+
+---
+
+## TFT_eSPI Setup
+
+The CYD uses the **ILI9341_2** driver with specific pin assignments. Copy the provided template over the default `User_Setup.h`:
+
+```bash
+cp templates_for_TFT_eSP/User_Setup.h.ST7789_240x320.h \
+   ~/Arduino/libraries/TFT_eSPI/User_Setup.h
+```
+
+> Use the `User_Setup.h.ST7789_240x320.h` template — it is configured for the CYD ILI9341 display with the correct pins and `TFT_INVERSION_ON`.
+
+If you prefer to edit `User_Setup.h` manually, the key settings are:
+
+```cpp
+#define ILI9341_2_DRIVER
+#define TFT_WIDTH  240
+#define TFT_HEIGHT 320
+#define TFT_CS   15
+#define TFT_DC    2
+#define TFT_MOSI 13
+#define TFT_SCLK 14
+#define TFT_MISO 12
+#define TFT_BL   21
+#define TFT_INVERSION_ON
+#define SPI_FREQUENCY  40000000
+```
+
+---
+
+## Creating ROM Header Files
+
+The emulator embeds CoCo ROMs directly into flash as C arrays (`USE_EMBEDDED_ROMS=1` in `config.h`). You must generate these headers from your own ROM files before compiling.
+
+**You need these three ROM files** (obtain legally from a real CoCo 2 or a licensed source):
+
+| ROM file        | Size  | Description           |
+|-----------------|-------|-----------------------|
+| `bas13.rom`     | 8 KB  | Color BASIC 1.3       |
+| `extbas11.rom`  | 8 KB  | Extended BASIC 1.1    |
+| `disk11.rom`    | 8 KB  | Disk BASIC 1.1        |
+
+### Generate headers with rom2header.py
+
+From the **project root** (`CoCo2-CYD/` parent directory):
+
+```bash
+python3 tools/rom2header.py roms/bas13.rom     bas13    > CoCo2-CYD/src/roms/bas13_rom.h
+python3 tools/rom2header.py roms/extbas11.rom  extbas11 > CoCo2-CYD/src/roms/extbas11_rom.h
+python3 tools/rom2header.py roms/disk11.rom    disk11   > CoCo2-CYD/src/roms/disk11_rom.h
+```
+
+Each command reads the binary ROM file and writes a `PROGMEM` C array header. The script also prints the filename and byte count as a comment at the top of each header.
+
+Verify the files were created:
+
+```bash
+ls -lh CoCo2-CYD/src/roms/*.h
+```
+
+You should see `bas13_rom.h`, `extbas11_rom.h`, and `disk11_rom.h`, each around **16 KB** (8 KB binary → hex array text).
+
+> ROM files are CRC-32 validated at boot. If the CRC does not match a known-good value, the emulator will print a warning to Serial but will still attempt to run.
+
+---
+
+## Compile & Upload
+
+All commands are run from the **`CoCo2-CYD/` parent directory** (one level above the `.ino` file).
+
+### Compile only
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 CoCo2-CYD/
+```
+
+### Upload only
+
+```bash
+arduino-cli upload --fqbn esp32:esp32:esp32 --port /dev/ttyUSB0 CoCo2-CYD/
+```
+
+### Compile + Upload in one step
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 CoCo2-CYD/ && \
+arduino-cli upload --fqbn esp32:esp32:esp32 --port /dev/ttyUSB0 CoCo2-CYD/
+```
+
+> Replace `/dev/ttyUSB0` with your actual port. On macOS it may be `/dev/cu.usbserial-*`. Run `arduino-cli board list` to find it.
+
+### Monitor serial output
+
+```bash
+arduino-cli monitor --port /dev/ttyUSB0 --config baudrate=115200
+```
+
+Startup diagnostics, ROM CRC results, and debug output appear here.
+
+---
 
 ## SD Card Setup
 
-Format your MicroSD card as **FAT32** and create the following structure:
+Format a MicroSD card as **FAT32**. Disk images can go anywhere on the card; the OSD file browser lets you navigate to them.
 
 ```
 /
-├── roms/
-│   ├── bas13.rom          # Color BASIC 1.3 (required)
-│   ├── extbas11.rom       # Extended BASIC 1.1 (required)
-│   └── disk11.rom         # Disk BASIC 1.1 (required for floppy support)
-└── (your .DSK and .VDK disk images anywhere on the card)
+└── (your .DSK and .VDK disk image files — any location)
 ```
 
-### ROM Files
+ROMs are **not** needed on the SD card when `USE_EMBEDDED_ROMS=1` (the default).
 
-| File           | Size | Description                      |
-|----------------|------|----------------------------------|
-| `bas13.rom`    | 8 KB | Color BASIC 1.3 (primary)        |
-| `bas12.rom`    | 8 KB | Color BASIC 1.2 (fallback)       |
-| `extbas11.rom` | 8 KB | Extended BASIC 1.1 (primary)     |
-| `extbas10.rom` | 8 KB | Extended BASIC 1.0 (fallback)    |
-| `disk11.rom`   | 8 KB | Disk BASIC 1.1 (primary)         |
-| `disk10.rom`   | 8 KB | Disk BASIC 1.0 (fallback)        |
+### Supported disk formats
 
-ROM files are validated by CRC-32 on startup. Fallback ROMs are loaded automatically if primary versions are not found.
+| Format | Extension | Notes |
+|--------|-----------|-------|
+| JVC    | `.DSK`    | Fully supported |
+| VDK    | `.VDK`    | 12-byte header, fully supported |
+| DMK    | `.DMK`    | Recognized but not mountable |
 
-### Supported Disk Formats
+---
 
-- **`.DSK`** (JVC format) — fully supported
-- **`.VDK`** (Virtual Disk with 12-byte header) — fully supported
+## Touchscreen Keyboard Controls
 
-## Build & Flash
+The CYD touchscreen acts as the CoCo keyboard. Function keys on the OSK:
 
-This is an **Arduino IDE** project (not PlatformIO).
+| Touch key | Action |
+|-----------|--------|
+| F1        | Toggle OSD supervisor menu |
+| F2        | Machine reset (prompts for confirmation) |
+| F5        | Toggle FPS overlay |
 
-### 1. Install Arduino IDE
+### Touch Calibration
 
-Download [Arduino IDE 2.x](https://www.arduino.cc/en/software).
+If the touchscreen feels mis-aligned, the emulator includes a built-in 6-point calibration procedure:
 
-### 2. Add ESP32 Board Support
+1. Hold the **BOOT** button for **5 seconds** while the device is powered on (before the BASIC prompt appears).
+2. Tap each of the 6 crosshair targets displayed on screen in order.
+3. Calibration data is written to **NVS** and loaded automatically on every subsequent boot.
 
-- Go to **File > Preferences** and add the ESP32 board manager URL
-- Go to **Tools > Board > Board Manager**, search for **esp32** by Espressif, and install it **(Tested with esp32:esp32 3.3.3)**
+To force fixed calibration values from `config.h` instead of NVS, set `TOUCH_CAL_OVERRIDE 1` in `config.h` and adjust the `TOUCH_X_MIN`, `TOUCH_X_MAX`, `TOUCH_Y_MIN`, `TOUCH_Y_MAX` constants to match your panel.
 
-### 3. Select Board Settings
-
-| Setting            | Value                    |
-|--------------------|--------------------------|
-| Board              | ESP32S3 Dev Module       |
-| CPU Frequency      | 240 MHz                  |
-| USB Mode           | USB-OTG (TinyUSB)        |
-| USB CDC On Boot    | Disabled                 |
-| PSRAM              | OPI PSRAM                |
-| Flash Size         | 8 MB / 16 MB (match your board) |
-| Partition Scheme   | Default or Huge App      |
-
-> Serial Monitor uses **UART** (not USB), since the USB PHY is dedicated to keyboard host mode.
-
-### 4. Install Required Libraries
-
-Via **Sketch > Include Library > Manage Libraries**:
-
-- **TFT_eSPI** by Bodmer — configure `User_Setup.h` for your display type and pins (Tested  using TFT_eSPI 2.5.43)
-- **SD** (built-in Arduino library)
-- **ESP32_USB_Host_HID** by esp32beans
-
-### 5. Configure
-
-Edit `config.h` to match your hardware:
-
-- `DISPLAY_TYPE` — 0 = ILI9341, 1 = ST7789, 3 = ST7796
-- `DISPLAY_SCALE_MODE` — 0 = 1:1 centered, 1 = scaled fill, 2 = zoom
-- `PIN_*` constants — adjust if your wiring differs
-- `RAM_SIZE_KB` — 16, 32, or 64
-
-Under Arduino1.8.19\libraries\TFT_eSPI **Replace User_Setup.h with templates based on display type** see folder /templates_for_TFT_eSP
-
-### 6. Compile & Upload
-
-- **Sketch > Verify/Compile** to build
-- **Sketch > Upload** via USB
-- Open **Serial Monitor at 115200 baud** to see startup diagnostics
-
-
-## Keyboard Controls
-
-| Key | Function |
-|-----|----------|
-| F1  | Toggle OSD (supervisor menu) |
-| F2  | Machine reset |
-| F3  | Quick mount disk |
-| F5  | Toggle FPS display |
-
-The USB keyboard is mapped to the CoCo's 7x8 key matrix. Standard alphanumeric keys, arrow keys, Enter, Shift, and common symbols work as expected.
+---
 
 ## On-Screen Display (OSD)
 
-Press **F1** to open the supervisor overlay. From here you can:
+Press **F1** on the touchscreen to open the supervisor overlay. Emulation pauses while the OSD is active.
 
-- **Mount/Eject Disks** — browse the SD card and mount .DSK/.VDK images to drives 0–3
+- **Mount Disk** — browse the SD card and mount a `.DSK` or `.VDK` image to drives 0–3
 - **Disk Manager** — view mounted drives and eject disks
-- **Reset Machine** — warm or cold reset with confirmation
-- **About** — version info and free memory
+- **Reset Machine** — warm or cold reset with confirmation dialog
+- **About** — version info and free heap
 
-The OSD uses a CoCo green phosphor theme. Disk images are fully cached in PSRAM on mount for zero-latency access during emulation.
+Touch the **F1** hotzone again (top-left of the OSK) or tap **Back** inside the OSD to return to emulation.
 
-## Architecture
+---
 
-The emulator runs on the ESP32-S3's **dual cores**:
+## Key config.h Settings
 
-- **Core 0** — USB host event loop (keyboard HID processing)
-- **Core 1** — Main emulation loop (CPU, video, audio, OSD)
+| Setting               | Default | Description |
+|-----------------------|---------|-------------|
+| `USE_EMBEDDED_ROMS`   | 1       | 1 = ROMs baked into flash (requires `.h` headers); 0 = load from SD `/roms/` |
+| `DISPLAY_TYPE`        | 0       | 0 = ILI9341, 1 = ST7789, 3 = ST7796 |
+| `DISPLAY_SCALE_MODE`  | 0       | 0 = 1:1 centered, 1 = scaled fill, 2 = zoom |
+| `AUDIO_PITCH_TRIM`    | -6      | Pitch correction offset (–6 ≈ 1% accuracy vs XRoar) |
+| `TOUCH_KB_ENABLED`    | 1       | XPT2046 touchscreen OSK |
+| `TOUCH_CAL_OVERRIDE`  | 0       | 1 = use fixed `TOUCH_X/Y_MIN/MAX` from `config.h` instead of NVS calibration |
+| `JOYSTICK_ENABLED`    | 0       | Disabled — GPIO36 conflicts with XPT2046 IRQ |
+| `USE_USB_HOST`        | 0       | Disabled — standard ESP32 has no USB OTG |
+| `USE_PSRAM`           | 0       | Disabled — CYD has no PSRAM |
 
-Key events are passed between cores via a lock-free FreeRTOS queue.
+---
 
-### Emulation Loop
+## Architecture Overview
+
+```
+CoCo2-CYD.ino  — setup() + loop()
+     |
+     +-- HAL Layer (src/hal/)
+     |     hal_video.cpp    — ILI9341 TFT via TFT_eSPI, VRAM shadow compare
+     |     hal_audio.cpp    — ESP32 DAC, pitch-corrected scanline buffer, 22050 Hz ISR
+     |     hal_keyboard.cpp — XPT2046 touch → CoCo key matrix
+     |     hal_storage.cpp  — SD card, ROM loading
+     |
+     +-- Emulation Core (src/core/)
+     |     mc6809.cpp       — Full Motorola 6809 CPU
+     |     mc6821.cpp       — Dual PIA (keyboard, audio, vsync IRQ)
+     |     mc6847.cpp       — VDG (text + graphics modes)
+     |     sam6883.cpp      — Address mux + VDG display counter
+     |     machine.cpp      — System wiring, memory map, frame loop
+     |
+     +-- Supervisor / OSD (src/supervisor/)
+           supervisor.cpp   — State machine, NVS persistence
+           sv_filebrowser   — SD card directory browser
+           sv_disk.cpp      — WD1793 FDC + direct SD sector I/O
+           sv_render.cpp    — Blue-theme OSD renderer
+```
+
+### Main loop order
 
 ```
 loop():
-  1. hal_process_input()        — read keyboard queue, joystick ADC
-  2. supervisor_update_and_render()  — if OSD active, render and return
-  3. machine_run_frame()        — emulate 262 scanlines (14,916 CPU cycles)
-  4. hal_render_frame()         — push framebuffer to TFT via SPI
+  1. hal_process_input()             — XPT2046 touch + deferred key releases
+  2. supervisor_update_and_render()  — OSD (skips emulation while active)
+  3. machine_run_frame()             — 262 scanlines: CPU + VDG + SAM + FDC
+  4. hal_render_frame()              — VRAM shadow compare → SPI push if changed
+  5. hal_keyboard_draw_overlay()     — OSK hotzone indicator on TFT border
 ```
 
-### CoCo 2 Memory Map
+---
 
-```
-$0000–$7FFF   RAM (up to 64 KB with SAM paging)
-$8000–$9FFF   Extended BASIC ROM (8 KB)
-$A000–$BFFF   Color BASIC ROM (8 KB)
-$C000–$FEFF   Cartridge / Disk BASIC ROM (16 KB)
-$FF00–$FF3F   PIA registers (keyboard, audio, VDG control)
-$FF40–$FF5F   Disk controller (WD1793)
-$FFC0–$FFDF   SAM control registers
-```
+## Known Limitations
 
-### Architecture Diagrams
+- No TFT MISO wired on CYD — brief black flash when closing OSD (repaints next frame)
+- Joystick disabled (`JOYSTICK_ENABLED=0`) — GPIO36 conflict with XPT2046 IRQ
+- Max 128 file entries visible in the SD file browser
+- DMK disk format not mountable
+- Machine type fixed to CoCo 2 at compile time (`MACHINE_TYPE 3` in `config.h`)
+- No physical keyboard — touchscreen OSK only (no USB OTG on standard ESP32)
 
-- `ESP32_COCO_CORE.png` — CPU, memory map, PIA, VDG, SAM wiring
-- `DISK_HAL.png` — FDC, PSRAM disk cache, SD card interface
+---
 
 ## Project Structure
 
 ```
-ESP32_CoCo2_XRoar_Port.ino  Main Arduino sketch (setup/loop)
-config.h                    Hardware and build configuration
-src/
-├── core/                   Emulation core
-│   ├── machine.h/cpp         CoCo machine — memory map, chip wiring, interrupts
-│   ├── mc6809.h/cpp          MC6809 CPU — full opcode set with cycle-accurate timing
-│   ├── mc6809_opcodes.h      Opcode table and cycle counts
-│   ├── mc6821.h/cpp          6821 PIA — peripheral I/O
-│   ├── mc6847.h/cpp          MC6847 VDG — scanline video rendering
-│   └── sam6883.h/cpp         SAM — address multiplexing and clock control
-├── hal/                    Hardware Abstraction Layer
-│   ├── hal.h/cpp             HAL dispatcher (init, input, render)
-│   ├── hal_video.cpp         TFT display output and scaling
-│   ├── hal_audio.cpp         Audio DAC/I2S output
-│   ├── hal_keyboard.cpp      USB HID to CoCo matrix mapping
-│   ├── hal_joystick.cpp      Analog joystick input
-│   ├── hal_storage.cpp       SD card access
-│   ├── usb_kbd_host.h/cpp    USB host driver (runs on Core 0)
-│   └── CoCoJoystick.h/cpp    Joystick class with calibration
-├── supervisor/             On-Screen Display system
-│   ├── supervisor.h/cpp      OSD lifecycle and state machine
-│   ├── sv_menu.h/cpp         Menu definitions and actions
-│   ├── sv_disk.h/cpp         WD1793 FDC emulation and PSRAM cache
-│   ├── sv_filebrowser.h/cpp  SD card file browser
-│   └── sv_render.h/cpp       OSD rendering (green phosphor theme)
-├── roms/
-│   └── rom_loader.h/cpp      ROM loading with CRC-32 validation
-├── tests/
-│   └── integration_test.h/cpp  LOADM binary verification
-└── utils/
-    └── debug.h               Debug output macros
+CoCo2-CYD/
+  CoCo2-CYD.ino         Main sketch (setup + loop)
+  config.h              Hardware config, pins, timing
+
+  src/core/
+    machine.cpp/.h      System integration, memory map, frame loop
+    mc6809.cpp/.h       MC6809 CPU (all opcodes, cycle-accurate)
+    mc6821.cpp/.h       MC6821 PIA (2 instances)
+    mc6847.cpp/.h       MC6847 VDG (text + 8 graphics modes)
+    sam6883.cpp/.h      SAM6883 (address mux + VDG counter)
+
+  src/hal/
+    hal_video.cpp       TFT_eSPI display, sprite, VRAM shadow compare
+    hal_audio.cpp       ESP32 DAC audio, scanline buffer, ISR
+    hal_keyboard.cpp    CoCo matrix mapping, XPT2046 touch, deferred release
+    CoCo2Keyboard.h     On-screen keyboard layout + touch dispatch
+    hal_storage.cpp     SD card init + ROM loading
+
+  src/supervisor/
+    supervisor.cpp/.h   OSD lifecycle, state machine, NVS persistence
+    sv_menu.cpp/.h      Main menu items and key handling
+    sv_filebrowser.cpp/.h  SD card directory browser
+    sv_disk.cpp/.h      WD1793 FDC + direct SD sector I/O
+    sv_render.cpp/.h    OSD rendering engine (blue theme)
+    sv_debug.cpp/.h     Memory dump to Serial (S-Record / Intel HEX)
+
+  src/roms/
+    rom_loader.cpp/.h   CRC-32 validation; SD fallback loader
+    bas13_rom.h         Color BASIC 1.3 (generated — not in repo)
+    extbas11_rom.h      Extended BASIC 1.1 (generated — not in repo)
+    disk11_rom.h        Disk BASIC 1.1 (generated — not in repo)
+
+  templates_for_TFT_eSP/
+    User_Setup.h.ST7789_240x320.h   TFT_eSPI config for CYD ILI9341
+
+tools/
+  rom2header.py         Converts .rom binary to PROGMEM C header
+
+roms/
+  bas13.rom             ROM binaries (not redistributed)
+  extbas11.rom
+  disk11.rom
 ```
 
-## Known Limitations
-
-- No TFT framebuffer readback (no MISO) — brief black flash when closing OSD
-- CoCo Joystic uses 
-- DMK disk format is recognized but not mountable
-- Max 128 file entries in the SD card browser
-- Machine selection is fixed to CoCo 2 (Dragon/CoCo 1 stubs only)
-- Settings screen not yet implemented
-- Sound does not match CoCo's frequency
-- Integration (Demo Mode) on going
-- NTSC TV Emulation stub only
+---
 
 ## Credits
 
-- **Reinaldo Torres / CoCo Byte Club** — ESP32 port and hardware design
-- **Ciaran Anscomb** — [XRoar](http://www.6809.org.uk/xroar/) CoCo/Dragon emulator (original source)
+- **Reinaldo Torres / CoCo Byte Club** — ESP32 CYD port
+- **Ciaran Anscomb** — [XRoar](http://www.6809.org.uk/xroar/) (original emulator source)
 - **Claude Code (Anthropic)** — co-development of the ESP32 port
 - **Bodmer** — [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) display library
-- **esp32beans** — [ESP32_USB_Host_HID](https://github.com/esp32beans/ESP32_USB_Host_HID) library
 
 ## License
 
-This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+Licensed under the **GNU General Public License v3.0 or later** — see [LICENSE](LICENSE) for the full text.
 
+This project is derived from [XRoar](https://www.6809.org.uk/xroar/) by Ciaran Anscomb.
+Current ESP32 CYD port by Reinaldo Torres / CoCoByte Club —
+<https://github.com/reyco2000/CoCo2-CYD>

@@ -1,15 +1,15 @@
 /*
- * ============================================================
- *   CoCo_ESP32 Beta-1 March 2026 - CoCo 2 Emulator for ESP32-S3
+ * =============================================================
+ *   CoCo2-CYD Beta-1 March 2026 - CoCo 2 Emulator for ESP32 CYD
  *   (C) 2026 Reinaldo Torres / CoCo Byte Club
- *   https://github.com/reyco2000/ESP32_CoCo2_XRoar_Port
- *   Based on XRoar by Ciaran Anscomb
- *   ESP32 Port of XRoar co-developed with Claude Code (Anthropic)
+ *   https://github.com/reyco2000/CoCo2-CYD
+ *   Based on XRoar Emulator by Ciaran Anscomb
+ *   CO-developed with Claude Code (Anthropic)
  *   MIT License
- * ============================================================
+ * =============================================================
  *  File   : supervisor.cpp
  *  Module : OSD supervisor — F1-activated overlay with menu, disk mounting, and machine reset
- * ============================================================
+ * =============================================================
  */
 
 /*
@@ -61,16 +61,20 @@ static void capture_snapshot(void) {
 static void restore_snapshot(void) {
     // Clear the OSD area so no ghost pixels remain in border margins.
     // The emulator sprite covers (32,24)-(288,216) and will repaint
-    // that region on the next frame. Clear the full OSD rect to be safe.
+    // that region on the next frame. Clear from the OSD's left edge all
+    // the way out to the display's right edge so the scrollbar zone and
+    // any other right-margin pixels (FPS overlay, etc.) are wiped.
     TFT_eSPI* tft = hal_video_get_tft();
     if (tft) {
-        tft->fillRect(SV_BORDER_X, SV_BORDER_Y, SV_BORDER_W, SV_BORDER_H, TFT_BLACK);
+        int clear_w = DISPLAY_WIDTH - SV_BORDER_X;
+        tft->fillRect(SV_BORDER_X, SV_BORDER_Y, clear_w, SV_BORDER_H, TFT_BLACK);
     }
 }
 
 // ============================================================
 // Disk manager sub-screen
 // ============================================================
+#if DISK_ENABLED
 
 static void disk_manager_on_key(Supervisor_t* s, uint8_t hid_usage, bool pressed) {
     if (!pressed) return;
@@ -140,7 +144,7 @@ static void disk_manager_on_key(Supervisor_t* s, uint8_t hid_usage, bool pressed
 }
 
 static void disk_manager_render(Supervisor_t* s) {
-    sv_render_frame("Disk Manager", "ENT=Mount/Eject M=Mount E=Eject F=Flush");
+    sv_render_frame("Disk Manager", "Tap to select, again to confirm");
 
     for (int i = 0; i < SV_DISK_MAX_DRIVES; i++) {
         char label[48];
@@ -174,6 +178,8 @@ static void disk_manager_render(Supervisor_t* s) {
         }
     }
 }
+
+#endif // DISK_ENABLED
 
 // ============================================================
 // About screen
@@ -264,7 +270,7 @@ static void about_render(Supervisor_t* s) {
     tft->setTextFont(1);  // 8px font for subtitle
     tft->setTextColor(ABOUT_CYAN, SV_COLOR_BG);
     tft->setTextDatum(TC_DATUM);
-    tft->drawString("CoCo 2 Emulator for the ESP32-S3", cx, y);
+    tft->drawString("CoCo 2 Emulator for the CYD", cx, y);
 
     // --- Decorative separator ---
     y += 14;
@@ -308,8 +314,12 @@ static void about_render(Supervisor_t* s) {
     // --- Row 7: System stats ---
     y += 20;
     char stats[64];
+#if USE_PSRAM
     snprintf(stats, sizeof(stats), "Heap:%dK  PSRAM:%dK",
              ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
+#else
+    snprintf(stats, sizeof(stats), "Heap:%dK", ESP.getFreeHeap() / 1024);
+#endif
     tft->setTextColor(ABOUT_DK_GREEN, SV_COLOR_BG);
     tft->drawString(stats, cx, y);
 
@@ -345,6 +355,106 @@ static void confirm_on_key(Supervisor_t* s, uint8_t hid_usage, bool pressed) {
 }
 
 // ============================================================
+// Touch handlers
+// ============================================================
+
+static void confirm_on_touch(Supervisor_t* s, uint16_t x, uint16_t y) {
+    int dw = 200, dh = 80;
+    int dx = (DISPLAY_WIDTH - dw) / 2;
+    int dy = (DISPLAY_HEIGHT - dh) / 2;
+    int btn_y = dy + 45;
+
+    // Yes button: dx+20, btn_y, 60x20
+    if (x >= (uint16_t)(dx + 20) && x < (uint16_t)(dx + 80) &&
+        y >= (uint16_t)btn_y      && y < (uint16_t)(btn_y + 20)) {
+        if (s->confirm_callback) s->confirm_callback(true, s->confirm_context);
+        s->needs_redraw = true;
+        return;
+    }
+    // No button: dx+120, btn_y, 60x20
+    if (x >= (uint16_t)(dx + 120) && x < (uint16_t)(dx + 180) &&
+        y >= (uint16_t)btn_y       && y < (uint16_t)(btn_y + 20)) {
+        if (s->confirm_callback) s->confirm_callback(false, s->confirm_context);
+        s->needs_redraw = true;
+        return;
+    }
+}
+
+#if DISK_ENABLED
+static void disk_manager_on_touch(Supervisor_t* s, uint16_t x, uint16_t y) {
+    // Tap title bar to return to main menu
+    if ((int)y >= SV_BORDER_Y && (int)y < SV_BORDER_Y + SV_TITLE_H) {
+        s->state = SV_MAIN_MENU;
+        s->needs_redraw = true;
+        return;
+    }
+    if (x < SV_BORDER_X || x >= SV_BORDER_X + SV_BORDER_W) return;
+
+    for (int i = 0; i < SV_DISK_MAX_DRIVES; i++) {
+        int row_y = SV_CONTENT_Y + (i * 2) * SV_ITEM_H;
+        if ((int)y >= row_y && (int)y < row_y + SV_ITEM_H * 2) {
+            if (s->touch_armed_row == i) {
+                // Second tap on the same drive → execute
+                s->touch_armed_row = -1;
+                if (s->machine && sv_disk_is_mounted(&s->machine->fdc, i)) {
+                    sv_disk_eject(&s->machine->fdc, i);
+                    supervisor_save_state();
+                } else {
+                    s->target_drive = i;
+                    s->prev_state = SV_DISK_MANAGER;
+                    s->state = SV_FILE_BROWSER;
+                    sv_filebrowser_open(s, s->current_path, s->target_drive);
+                }
+            } else {
+                // First tap (or moving to a new row) → arm and highlight
+                s->touch_armed_row = i;
+                s->menu_cursor = i;
+            }
+            s->needs_redraw = true;
+            return;
+        }
+    }
+}
+#endif
+
+void supervisor_on_touch(uint16_t x, uint16_t y, bool pressed) {
+    if (!pressed) return;
+
+    switch (sv.state) {
+        case SV_MAIN_MENU:
+            sv_menu_on_touch(&sv, x, y);
+            break;
+
+#if DISK_ENABLED
+        case SV_FILE_BROWSER:
+            sv_filebrowser_on_touch(&sv, x, y);
+            break;
+
+        case SV_DISK_MANAGER:
+            disk_manager_on_touch(&sv, x, y);
+            break;
+#endif
+
+        case SV_ABOUT:
+            sv.state = SV_MAIN_MENU;
+            sv.needs_redraw = true;
+            break;
+
+        case SV_CONFIRM_DIALOG:
+            confirm_on_touch(&sv, x, y);
+            break;
+
+        case SV_DEBUG_DUMP:
+            sv.state = SV_MAIN_MENU;
+            sv.needs_redraw = true;
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ============================================================
 // Public API
 // ============================================================
 
@@ -352,13 +462,13 @@ void supervisor_init(Machine* m) {
     memset(&sv, 0, sizeof(Supervisor_t));
     sv.state = SV_INACTIVE;
     sv.machine = m;
-    sv.emu_snapshot = nullptr;
     sv.file_entries = nullptr;
     strcpy(sv.current_path, "/");
 
     // Initialize FDC
     sv_disk_init(&m->fdc);
 
+#if DISK_ENABLED
     // Wire NMI callback
     m->fdc.nmi_callback = [](void* ctx, bool active) {
         Machine* mach = (Machine*)ctx;
@@ -370,6 +480,7 @@ void supervisor_init(Machine* m) {
         mach->cpu.halted = halted;
     };
     m->fdc.callback_context = m;
+#endif
 
     // Initialize render engine
     TFT_eSPI* tft = hal_video_get_tft();
@@ -378,7 +489,9 @@ void supervisor_init(Machine* m) {
     }
 
     sv_menu_init(&sv);
+#if DISK_ENABLED
     sv_filebrowser_init(&sv);
+#endif
     sv_debug_init(&sv);
 
     DEBUG_PRINT("Supervisor: initialized");
@@ -390,6 +503,7 @@ void supervisor_toggle(void) {
         capture_snapshot();
         sv.state = SV_MAIN_MENU;
         sv.menu_cursor = 0;
+        sv.touch_armed_row = -1;
         sv.needs_redraw = true;
         sv_menu_update_values(&sv);
         DEBUG_PRINT("Supervisor: activated");
@@ -418,6 +532,7 @@ void supervisor_on_key(uint8_t hid_usage, bool pressed) {
             sv_menu_on_key(&sv, hid_usage, pressed);
             break;
 
+#if DISK_ENABLED
         case SV_FILE_BROWSER:
             sv_filebrowser_on_key(&sv, hid_usage, pressed);
             break;
@@ -425,6 +540,7 @@ void supervisor_on_key(uint8_t hid_usage, bool pressed) {
         case SV_DISK_MANAGER:
             disk_manager_on_key(&sv, hid_usage, pressed);
             break;
+#endif
 
         case SV_ABOUT:
             if (pressed && (hid_usage == 0x29 || hid_usage == 0x28)) {  // ESC or ENTER
@@ -449,6 +565,14 @@ void supervisor_on_key(uint8_t hid_usage, bool pressed) {
 bool supervisor_update_and_render(void) {
     if (sv.state == SV_INACTIVE) return false;
 
+    // Centralized two-tap arming reset on state change. Any transition
+    // to a new screen requires a fresh first-tap to arm a row.
+    static SV_State last_state = SV_INACTIVE;
+    if (sv.state != last_state) {
+        sv.touch_armed_row = -1;
+        last_state = sv.state;
+    }
+
     if (!sv.needs_redraw) {
         delay(16);  // ~60 fps cap while in supervisor
         return true;
@@ -461,6 +585,7 @@ bool supervisor_update_and_render(void) {
             sv_menu_render(&sv);
             break;
 
+#if DISK_ENABLED
         case SV_FILE_BROWSER:
             sv_filebrowser_render(&sv);
             break;
@@ -468,6 +593,7 @@ bool supervisor_update_and_render(void) {
         case SV_DISK_MANAGER:
             disk_manager_render(&sv);
             break;
+#endif
 
         case SV_ABOUT:
             about_render(&sv);
@@ -523,6 +649,7 @@ void supervisor_load_state(void) {
     String last_dir = prefs.getString("last_dir", "/");
     strncpy(sv.current_path, last_dir.c_str(), sizeof(sv.current_path) - 1);
 
+#if DISK_ENABLED
     bool auto_mount = prefs.getBool("auto_mount", true);
     if (auto_mount && sv.machine) {
         for (int i = 0; i < SV_DISK_MAX_DRIVES; i++) {
@@ -534,6 +661,7 @@ void supervisor_load_state(void) {
             }
         }
     }
+#endif
 
     prefs.end();
 }
