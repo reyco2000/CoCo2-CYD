@@ -416,3 +416,6 @@ Licensed under the **GNU General Public License v3.0 or later** — see [LICENSE
 This project is derived from [XRoar](https://www.6809.org.uk/xroar/) by Ciaran Anscomb.
 Current ESP32 CYD port by Reinaldo Torres / CoCoByte Club —
 <https://github.com/reyco2000/CoCo2-CYD>
+## Contact
+Reinaldo Torres — reinaldo@example.com  
+GitHub: [@reyco2000](https://github.com/reyco2000)
