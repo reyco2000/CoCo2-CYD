@@ -20,19 +20,59 @@ The ST7796 variant provides 480×320 resolution. All pin assignments and display
 
 ## Pipeline
 
+The video pipeline is **split across two ESP32 cores**. Core 0 (the
+`cpu_emu` task) runs CPU + VDG emulation and captures a per-frame snapshot
+of palette indices. Core 1 (the Arduino loop) unpacks the snapshot into the
+sprite framebuffer, then pushes it over SPI.
+
 ```
-MC6847 VDG          Machine Loop            HAL Video             TFT
-─────────────      ──────────────          ──────────────        ─────
-line_buffer[256] → hal_video_render_scanline() → sprite FB → pushSprite()
-(palette indices)   (called per active line)     (RGB565)     (on present)
+Core 0 (cpu_emu task)                  Core 1 (Arduino loop)
+─────────────────────────              ──────────────────────────────────
+MC6847 VDG                             render_snapshot
+  ├─ line_buffer[256]                    ├─ pixel_chunks[8] (4 bpp packed)
+  ├─ pack to 4 bpp into snapshot         ├─ vram_chunks[2] (shadow source)
+  └─ via snapshot_row_ptr()              └─ line_valid[192]
+
+machine_run_frame_cpu_only:                          ┌──── frame_ready
+  262 × machine_run_scanline                         │
+  hal_audio_commit_frame                             ▼
+  memcpy VRAM → vram_chunks ──────────►  hal_video_snapshot_fill_sprite:
+  give frame_ready                         ├─ shadow compare (2 × memcmp)
+  take render_done (blocks) ◄────────────  ├─ unpack 4 bpp → sprite FB
+                                           │   (palette → RGB565)
+                                           └─ give render_done ─────────┐
+                                                                         │
+                                       hal_video_push_sprite_only:       │
+                                         └─ sprite->pushSprite() ◄───────┘
+                                            (~20 ms SPI, runs in
+                                             parallel with Core 0's
+                                             next frame)
 ```
 
-### Per-Scanline Flow
+### Per-Scanline Flow (Core 0)
 
 1. `machine_run_scanline()` runs CPU cycles for one scanline
-2. For active scanlines (0–191), `mc6847_render_scanline()` fills `vdg.line_buffer[]` with palette indices (0–11)
-3. `hal_video_render_scanline(line, pixels, width)` converts indices to RGB565 and writes into the sprite framebuffer
-4. After all 262 scanlines, `hal_video_present(ram, vdg_base, vdg_mode)` performs VRAM shadow compare and pushes the sprite to TFT only if the screen changed
+2. For active scanlines (0–191), `mc6847_render_scanline()` fills
+   `vdg.line_buffer[]` with palette indices (0–11)
+3. The machine layer packs the 256 indices to 128 bytes (4 bpp, two pixels
+   per byte) and writes them via `snapshot_row_ptr(snap, line)` into the
+   correct heap chunk. `line_valid[line]` is set to 1.
+4. (Legacy single-core fallback: `hal_video_render_scanline()` writes RGB565
+   directly into the sprite framebuffer — used only when the Core-0 task
+   wasn't created, e.g. snapshot alloc failure.)
+
+### Per-Frame Flow (Core 1)
+
+1. `xSemaphoreTake(frame_ready, 20 ms)` — wait for snapshot from Core 0
+2. `hal_video_snapshot_fill_sprite(snap)`:
+   - VRAM shadow compare (walks 2 × 3 KB chunks against `vram_shadow[6144]`)
+   - If unchanged AND `force_push_count == 0`, returns false → no push
+   - Otherwise unpack each `line_valid` row's 128 packed bytes into 256
+     palette indices, then convert to RGB565 in the sprite via the existing
+     `hal_video_render_scanline()` per row
+3. `xSemaphoreGive(render_done)` — Core 0 may now overwrite the snapshot
+4. `hal_video_push_sprite_only()` — `sprite->pushSprite(SPR_X, SPR_Y)` over
+   SPI. Runs in parallel with Core 0's next CPU+VDG frame.
 
 ### Frame Timing and VRAM Shadow Compare (OPT-16)
 
@@ -41,7 +81,9 @@ line_buffer[256] → hal_video_render_scanline() → sprite FB → pushSprite()
 - On mode or base change, a 10-frame force-push window ensures multi-frame screen setup (e.g., game title screens) is fully captured
 - `hal_video_force_repaint()` sets `force_push_count = 3` to force TFT pushes on demand — called when the supervisor OSD closes so the emulated display repaints over OSD residue (fixes blank screen after F1 toggle under OS-9 or any static-screen scenario)
 - **Replaces the old blind `FRAME_SKIP=1`** (which pushed every 2nd frame regardless of changes) with intelligent dirty detection — dirty frames push immediately, unchanged frames are free
-- **Measured performance** (2026-03-26): 64 FPS text mode (static), 45 FPS graphics (static), 27 FPS graphics (scrolling VRAM)
+- **Measured performance**:
+  - Pre-dual-core (single-thread): 64 FPS text static, 45 FPS graphics static, 25–27 FPS graphics scrolling
+  - Post-dual-core (Core 0 CPU / Core 1 SPI in parallel, 2026-05-12): **~70 FPS text static**, **~34 FPS graphics scrolling** — CPU and SPI push now overlap because `render_done` is released as soon as the sprite is filled, before `pushSprite` runs
 
 VRAM region sizes by mode:
 | Mode | VRAM bytes | memcmp cost |
@@ -130,13 +172,45 @@ Toggled via `hal_video_toggle_fps_overlay()` (mapped to F5 in supervisor).
 - Draws text directly on the TFT (not in the sprite) after `pushSprite()`, so it overlays the border area
 - Uses TFT_eSPI font 2 at position (2, 2)
 
+## Render Snapshot (Dual-Core Handoff)
+
+Defined in `src/core/render_snapshot.h` and allocated by
+`machine_init_render_handshake()` in `machine.cpp`. The snapshot is the
+*only* shared mutable state between Core 0 and Core 1; access is serialized
+through the `frame_ready` / `render_done` binary semaphores.
+
+```c
+typedef struct render_snapshot {
+    uint8_t* pixel_chunks[8];   // 8 × 3 KB heap chunks, 4 bpp packed
+    uint8_t* vram_chunks[2];    // 2 × 3 KB heap chunks (= 6 KB VRAM)
+    uint8_t  line_valid[192];   // mc6847 set this when it rendered the row
+    uint16_t vdg_base;
+    uint8_t  vdg_mode;
+    uint16_t vram_size;         // actual bytes used (mode-dependent)
+    uint32_t frame_id;
+} render_snapshot_t;
+```
+
+Why so many small chunks? The CYD has no PSRAM; after the 96 KB sprite +
+64 KB machine RAM + SD/SDK overhead, the post-init heap is fragmented
+enough that 6 KB+ contiguous blocks become scarce. On-device diagnostic
+showed 4 × 6 KB chunks succeed but a 5th fails. 3 KB chunks reliably fit.
+
+The pixel buffer holds **palette indices**, not RGB565 — 4 bits per pixel
+(VDG palette uses ≤ 12 colors so 4 bits is sufficient). This halves the
+buffer from 48 KB to 24 KB. Core 0 packs two indices per byte at scanline
+render time; Core 1 unpacks them just before the per-row palette lookup.
+
 ## Key Functions
 
 | Function | Purpose |
 |----------|---------|
 | `hal_video_init()` | Init TFT, create sprite, build palette and scale tables |
 | `hal_video_render_scanline()` | Convert one VDG scanline to RGB565 in sprite FB |
-| `hal_video_present(ram, vdg_base, vdg_mode)` | VRAM shadow compare + conditional push to TFT |
+| `hal_video_present(ram, vdg_base, vdg_mode)` | Legacy single-core path: VRAM shadow compare + conditional push (used only when CPU task wasn't created) |
+| `hal_video_snapshot_fill_sprite(snap)` | Dual-core phase 1: shadow compare + unpack snapshot into sprite. Returns true if push needed |
+| `hal_video_push_sprite_only()` | Dual-core phase 2: `pushSprite` only — no snapshot access, safe to overlap with Core-0 next frame |
+| `hal_video_present_snapshot(snap)` | Wrapper that calls fill then push (legacy/fallback) |
 | `hal_video_set_mode()` | Stub — mode changes handled by VDG/PIA directly |
 | `hal_video_force_repaint()` | Force next 3 frames to push (invalidates VRAM shadow) |
 | `hal_video_toggle_fps_overlay()` | Toggle FPS counter |

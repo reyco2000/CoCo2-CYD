@@ -25,6 +25,7 @@
 #include "sv_disk.h"
 #include "sv_debug.h"
 #include "sv_render.h"
+#include "../core/machine.h"
 #include "../hal/hal.h"
 #include "../utils/debug.h"
 #include <Preferences.h>
@@ -499,7 +500,16 @@ void supervisor_init(Machine* m) {
 
 void supervisor_toggle(void) {
     if (sv.state == SV_INACTIVE) {
-        // Activate
+        // Activate — pause the Core-0 CPU task (frame-aligned), then drain
+        // any pre-baked frame so the renderer side of the handshake stays
+        // balanced when emulation resumes.
+        machine_emulation_set_enabled(false);
+        SemaphoreHandle_t fr = machine_get_frame_ready_sem();
+        SemaphoreHandle_t rd = machine_get_render_done_sem();
+        if (fr && rd && xSemaphoreTake(fr, 0) == pdTRUE) {
+            xSemaphoreGive(rd);
+        }
+
         capture_snapshot();
         sv.state = SV_MAIN_MENU;
         sv.menu_cursor = 0;
@@ -512,6 +522,7 @@ void supervisor_toggle(void) {
         restore_snapshot();
         sv.state = SV_INACTIVE;
         hal_video_force_repaint();
+        machine_emulation_set_enabled(true);
         DEBUG_PRINT("Supervisor: deactivated");
     }
 }

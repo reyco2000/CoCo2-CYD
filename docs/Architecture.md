@@ -17,10 +17,24 @@ system with custom hardware abstraction for display, audio, keyboard, and storag
 
 ```
 +-----------------------------------------------------------+
-|               ESP32_CoCo2_XRoar_Port.ino                    |
+|                    CoCo2-CYD.ino                           |
 |                   (Arduino entry point)                    |
-|  setup() -> hal_init, machine_init, load_roms, video_init |
-|  loop()  -> hal_process_input, supervisor, machine_run    |
+|  setup() -> hal_init, video_init, storage, machine_init,   |
+|             supervisor_init, machine_init_render_handshake,|
+|             xTaskCreatePinnedToCore(cpu_task, ..., core=0) |
+|                                                            |
+|  Core 0 (cpu_emu task)        Core 1 (Arduino loopTask)    |
+|  ─────────────────────        ───────────────────────────  |
+|  machine_run_frame_           hal_process_input            |
+|    cpu_only()                 supervisor_update_and_render |
+|    (CPU+VDG+audio,            hal_video_snapshot_          |
+|     captures snapshot)          fill_sprite (3 ms)         |
+|                       \      /                             |
+|              frame_ready / render_done (binary semaphores) |
+|                                                            |
+|                              hal_video_push_sprite_only    |
+|                                (~20 ms SPI, parallel with  |
+|                                 Core 0's next frame)       |
 +-----------------------------------------------------------+
          |                    |                    |
          v                    v                    v
@@ -33,13 +47,13 @@ system with custom hardware abstraction for display, audio, keyboard, and storag
 | hal_keyboard   |  | MC6847 VDG       |  | File Browser   |
 | hal_joystick   |  | SAM6883          |  | FDC (WD1793)   |
 | hal_storage    |  | Machine wiring   |  | Render engine  |
-| usb_kbd_host   |  |                  |  |                |
+|                |  | render_snapshot  |  |                |
 +----------------+  +------------------+  +----------------+
          |                    |                    |
          v                    v                    v
 +-----------------------------------------------------------+
-|              ESP32-S3 Hardware                             |
-|  TFT SPI | LEDC PWM | USB Host | SD SPI | GPIO | PSRAM   |
+|              ESP32 (CYD, no PSRAM)                         |
+|  TFT SPI | DAC | XPT2046 touch | SD SPI | GPIO            |
 +-----------------------------------------------------------+
 ```
 
@@ -62,11 +76,41 @@ The Arduino sketch orchestrates boot and the main loop.
 8. `supervisor_load_state()` — restore last-mounted disks from NVS
 9. Wait up to 3s for USB keyboard enumeration
 
-**Main loop (loop):**
-1. `hal_process_input()` — drain USB keyboard queue, tick deferred releases
+**Boot sequence — Core 0 task creation:**
+
+After `supervisor_init()` and `supervisor_load_state()`, setup() also calls:
+
+10. `machine_init_render_handshake()` — allocate the render snapshot (4 bpp
+    pixel buffer + VRAM region, ~30 KB across 10 small heap chunks of ~3 KB
+    each) and create the `frame_ready` / `render_done` binary semaphores.
+11. `xTaskCreatePinnedToCore(cpu_task, "cpu_emu", 8192, NULL, 2, ..., 0)` —
+    pin the CPU emulation task to Core 0.
+
+If the snapshot allocation fails on a low-memory build, the task is NOT
+created and `loop()` falls back to running `machine_run_frame()` synchronously
+on Core 1 — same behavior as the original single-core path.
+
+**Main loop (Core 1 `loop()`):**
+1. `hal_process_input()` — XPT2046 touch, tick deferred releases
 2. `supervisor_update_and_render()` — if active, render OSD and skip emulation
-3. `machine_run_frame()` — execute 262 scanlines of CPU + VDG
-4. `hal_render_frame()` — push sprite to TFT
+3. `xSemaphoreTake(frame_ready, 20 ms)` — wait for Core 0 to produce a frame
+4. `hal_video_snapshot_fill_sprite()` — VRAM shadow compare + 4 bpp unpack
+   into sprite framebuffer (~3 ms)
+5. `xSemaphoreGive(render_done)` — release snapshot; Core 0 starts next frame
+6. `hal_video_push_sprite_only()` — pushSprite over SPI (~20 ms; Core 0 runs
+   in parallel)
+7. `hal_keyboard_draw_overlay()` — OSK hotzone on TFT border
+8. `hal_audio_debug_tick()` — sound debug
+
+**Core 0 `cpu_task` body:**
+1. If `!machine_emulation_is_enabled()` (supervisor active): `vTaskDelay(5)`, retry
+2. `machine_run_frame_cpu_only()`:
+   - `xSemaphoreTake(render_done, portMAX_DELAY)`
+   - 262 × `machine_run_scanline` (CPU + VDG render → snapshot 4 bpp pack, audio capture)
+   - `hal_audio_commit_frame()`
+   - memcpy VRAM region → snapshot vram chunks
+   - `xSemaphoreGive(frame_ready)`
+3. `vTaskDelay(1)` — feed IDLE0 / task watchdog
 
 ---
 

@@ -42,9 +42,13 @@ These are allocated with `malloc` / `new` at runtime. The largest one (`sprite`)
 | Allocation | Size | When | Source |
 |---|---|---|---|
 | Video sprite (256×192×2 bytes RGB565) | 96 KB | `hal_video_init()` | `hal_video.cpp` — tries PSRAM first, falls back to heap; on CYD always heap |
+| Render snapshot struct | ~250 B | `machine_init_render_handshake()` | `machine.cpp` — pointers + scalars |
+| Render snapshot pixel chunks (8 × 3 KB) | 24 KB | `machine_init_render_handshake()` | `machine.cpp` — 4 bpp packed palette indices, split into small chunks because post-init heap is fragmented |
+| Render snapshot VRAM chunks (2 × 3 KB) | 6 KB | `machine_init_render_handshake()` | `machine.cpp` — source of OPT-16 shadow compare |
 | `SV_FileEntry[128]` file browser list | ~5 KB | First file browser open | `sv_filebrowser.cpp` — one `malloc`, never freed |
 | `CoCo2Keyboard` OSK object | ~1 KB | First touch frame after video init | `hal_keyboard.cpp` — lazy init |
-| **Total heap** | **~102 KB** | | |
+| `cpu_emu` task stack | 8 KB | `xTaskCreatePinnedToCore()` in setup() | FreeRTOS internal |
+| **Total heap** | **~140 KB** | | |
 
 ---
 
@@ -56,10 +60,11 @@ Region          Where     Size     Notes
 Embedded ROMs   Flash     24 KB    PROGMEM, zero RAM cost
 ─────────────────────────────────────────────────────────────
 Static segment  DRAM      70 KB    Permanent (machine RAM 64K + VRAM shadow 6K)
-Heap peak       DRAM     102 KB    Video sprite 96K + file browser 5K + OSK 1K
+Heap peak       DRAM     140 KB    Sprite 96K + snapshot 30K + cpu_emu stack 8K
+                                   + file browser 5K + OSK 1K
 ─────────────────────────────────────────────────────────────
-Total DRAM used           172 KB   of ~320 KB available
-Free heap (est.)          ~148 KB  after all init completes
+Total DRAM used           210 KB   of ~320 KB available
+Free heap (est.)           ~80 KB  after all init + handshake completes
 ─────────────────────────────────────────────────────────────
 PSRAM                     0        Not present on standard CYD
 ```
@@ -76,6 +81,21 @@ The init sequence in `setup()` is ordered to guarantee the 96 KB sprite allocati
 4. `machine_init()` — `s_machine_ram` is static so heap is not involved, but chips are wired here
 5. `machine_load_roms()` — points ROM pointers to flash; no allocation
 6. `supervisor_init()` — small struct init; file entry array deferred until first browse
+7. `machine_init_render_handshake()` — **render snapshot allocated LAST** (~30 KB in 10 small heap chunks of ~3 KB each). Must run after sprite + machine RAM so it doesn't displace the sprite into upper DRAM (which breaks SD card init).
+
+### Snapshot chunking (why so many small allocs)
+
+On-device diagnostic after the working init sequence:
+- Free heap: 113 KB
+- Largest contiguous free block: 59 KB *(reported by `heap_caps_get_largest_free_block`)*
+- 12 KB allocs: succeed once, **fail on second attempt** — only one block big enough exists
+- 6 KB allocs: succeed 4×, **fail on 5th**
+- 3 KB allocs: succeed for all 10 snapshot chunks
+
+The "largest" number is misleading on ESP32 because heap is split across the
+lower DRAM region (~0x3FFB_xxxx) and an upper region (~0x3FFE_xxxx) with
+different cap flags; not every region accepts every alloc. Splitting the
+snapshot into 8 × 3 KB pixel chunks + 2 × 3 KB VRAM chunks reliably fits.
 
 ---
 

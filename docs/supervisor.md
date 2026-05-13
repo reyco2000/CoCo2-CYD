@@ -55,16 +55,19 @@ States are defined in `supervisor.h` as `SV_State` enum:
 
 ## Main Loop Integration
 
-In the main loop (typically `loop()` in the .ino):
+With CPU emulation pinned to Core 0, the supervisor is still rendered from
+Core 1 (`loop()`). When active it short-circuits the renderer-side consumer:
 
 ```
 if (supervisor_update_and_render()) {
-    return;  // skip emulation this frame
+    yield();
+    return;  // skip frame_ready consumption — OSD owns the screen
 }
-// ... run emulation ...
+// ... take frame_ready, fill sprite, give render_done, push sprite ...
 ```
 
-Key dispatch from USB keyboard:
+Key dispatch (from XPT2046 touch on CYD, or USB keyboard on the original
+ESP32-S3 build):
 
 ```
 if (supervisor_is_active()) {
@@ -73,6 +76,31 @@ if (supervisor_is_active()) {
     supervisor_toggle();
 }
 ```
+
+### Pausing the Core-0 CPU task
+
+`supervisor_toggle()` (in supervisor.cpp:500) drives the cross-core pause:
+
+**On activate (OSD opening):**
+1. `machine_emulation_set_enabled(false)` — Core-0 `cpu_task` will see this
+   flag at the top of its next loop iteration and `vTaskDelay(5)` instead of
+   running a frame. The pause is **frame-aligned** — never mid-scanline or
+   mid-disk-callback (FDC sector I/O runs inside `machine_run_scanline`).
+2. **Drain a stale `frame_ready`:** if Core 0 had just finished a frame and
+   given `frame_ready` before the flag flipped, the renderer side hasn't
+   consumed it yet. Take it (non-blocking) and re-give `render_done` so the
+   handshake stays balanced when emulation resumes.
+3. `capture_snapshot()` — saves the back-buffer for restore-on-close.
+4. Set OSD state and `needs_redraw`.
+
+**On deactivate (OSD closing):**
+1. `restore_snapshot()` — repaints the emulator framebuffer.
+2. `hal_video_force_repaint()` — bumps `force_push_count = 3` so the next
+   three pushes happen even if VRAM hasn't changed (clears OSD residue).
+3. `machine_emulation_set_enabled(true)` — Core 0 resumes producing frames.
+
+The semaphores are NOT destroyed across activate/deactivate; they survive
+for the life of the process.
 
 ---
 

@@ -1,9 +1,11 @@
 # ESP32_CoCo2_XRoar_Port Performance Analysis Report
 
-> **Baseline:** ~26 FPS (~0.43x real-time), boot to "DISK EXTENDED BASIC" ~7 seconds
+> **Baseline (pre-OPT-9):** ~25–27 FPS scrolling graphics, ~64 FPS text static
+> **Current (post-OPT-9 dual-core):** ~34 FPS scrolling graphics, ~70 FPS text static
 > **Target:** 30-35 FPS (practical target); DMA ceiling ~48 FPS (physical SPI limit)
-> **Hardware:** ESP32-S3 N16R8 (240 MHz dual-core, 8 MB PSRAM, 16 MB flash)
-> **Last updated:** 2026-03-26
+> **Hardware:** ESP32 (CYD, no PSRAM); some sections below still reference the
+> original ESP32-S3 N16R8 build and may be stale for the CYD port.
+> **Last updated:** 2026-05-12
 >
 > **Implementation log:**
 > - [x] OPT-3: Replace drawPixel() with direct FB write (2026-03-16)
@@ -22,8 +24,18 @@
 > - [ ] OPT-7: Overlap USB wait with emulation — DEFERRED (keyboard needs full 3s enumeration window)
 > - [x] OPT-16: VRAM shadow compare — skip SPI push on unchanged screen (2026-03-26) — +37 FPS text, +18 FPS static gfx
 > - [ ] OPT-10: Adaptive frame skip
-> - [ ] OPT-9: Dual-core rendering on Core 0
+> - [x] **OPT-9: Dual-core rendering — CPU on Core 0, SPI push on Core 1** (2026-05-12) — **+9 FPS scrolling graphics (25→34), +6 FPS text (64→70)**
 > - [ ] ~~OPT-8: Pack CPU flags into bitfield~~ — SKIP (negligible)
+>
+> **OPT-9 details:**
+> - CPU emulation pinned to Core 0 via `xTaskCreatePinnedToCore` (`cpu_emu` task, 8 KB stack, priority 2).
+> - Core 0 produces a render snapshot (4 bpp palette indices for 192×256 pixels in 8 × 3 KB heap chunks, plus 6 KB VRAM in 2 × 3 KB chunks) each frame.
+> - Core 1 (`loop()`) consumes the snapshot via `frame_ready`/`render_done` binary semaphores. The renderer releases `render_done` **after** filling the sprite but **before** the slow `pushSprite`, so Core 0 starts the next frame in parallel with the ~20 ms SPI transfer.
+> - Two concurrency hazards required attention:
+>   1. `ram[]` accessed concurrently → solved by snapshotting VRAM region into the handshake struct.
+>   2. Sprite framebuffer written by VDG concurrently with Core-1 `pushSprite` → solved by capturing palette indices into a separate snapshot pixel buffer; Core 1 converts to RGB565 in the sprite, then pushes.
+> - Supervisor pauses Core 0 via a `machine_emulation_set_enabled(false)` flag plus a `frame_ready` drain at OSD activate.
+> - Memory: snapshot = ~30 KB heap (split into 3 KB chunks to fit fragmented post-init heap; 6 KB+ single allocs unreliable on CYD).
 >
 > **Known issue:** Disk read corruption (LOAD/LOADM) occurred during past memory-related optimizations. Fixed, but any change to memory layout or machine_read/write must be validated with LOAD/LOADM.
 

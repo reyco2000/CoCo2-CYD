@@ -327,6 +327,94 @@ void hal_video_present(const uint8_t* ram, uint16_t vdg_base, uint8_t vdg_mode) 
     hal_keyboard_draw_overlay();  // hotzone buttons always visible in border
 }
 
+// ---------------------------------------------------------------------------
+// Dual-core renderer: consume a pixel snapshot produced by the Core-0 CPU
+// task. Walks the 192x256 palette-index buffer, converts to RGB565 in the
+// sprite, then runs the same shadow-compare + pushSprite as hal_video_present.
+// ---------------------------------------------------------------------------
+#include "../core/render_snapshot.h"
+
+// Phase 1: read snapshot, run shadow compare, fill the sprite framebuffer.
+// Returns true if a pushSprite should follow (i.e. the frame was different
+// from the last pushed frame). After this returns, the snapshot is no longer
+// needed and the CPU task can be allowed to overwrite it.
+bool hal_video_snapshot_fill_sprite(const struct render_snapshot* snap) {
+    if (!display_available || !sprite || !snap) return false;
+    if (hal_keyboard_osk_visible()) return false;
+
+    if (fps_overlay_enabled) {
+        fps_update();
+    }
+
+    // OPT-16: shadow compare against captured VRAM (split across 2 chunks
+    // on the Core-0 side so it can fit in fragmented heap).
+    bool mode_or_base_changed =
+        (snap->vdg_base != shadow_base || snap->vdg_mode != shadow_mode);
+    if (mode_or_base_changed) force_push_count = 10;
+
+    if (force_push_count == 0) {
+        bool unchanged = true;
+        uint16_t off = 0;
+        for (int i = 0; i < SNAPSHOT_VRAM_CHUNKS && off < snap->vram_size; i++) {
+            uint16_t cmp = (uint16_t)((snap->vram_size - off > SNAPSHOT_VRAM_CHUNK)
+                ? SNAPSHOT_VRAM_CHUNK : (snap->vram_size - off));
+            if (memcmp(vram_shadow + off, snap->vram_chunks[i], cmp) != 0) {
+                unchanged = false;
+                break;
+            }
+            off = (uint16_t)(off + cmp);
+        }
+        if (unchanged) return false;
+    }
+
+    if (force_push_count > 0) force_push_count--;
+
+    {
+        uint16_t off = 0;
+        for (int i = 0; i < SNAPSHOT_VRAM_CHUNKS && off < snap->vram_size; i++) {
+            uint16_t cpy = (uint16_t)((snap->vram_size - off > SNAPSHOT_VRAM_CHUNK)
+                ? SNAPSHOT_VRAM_CHUNK : (snap->vram_size - off));
+            memcpy(vram_shadow + off, snap->vram_chunks[i], cpy);
+            off = (uint16_t)(off + cpy);
+        }
+    }
+    shadow_base = snap->vdg_base;
+    shadow_mode = snap->vdg_mode;
+
+    // Unpack packed 4-bpp palette indices into the sprite framebuffer.
+    uint8_t unpacked[VDG_ACTIVE_WIDTH];
+    for (int line = 0; line < VDG_ACTIVE_HEIGHT; line++) {
+        if (!snap->line_valid[line]) continue;
+        const uint8_t* packed = snapshot_row_cptr(snap, line);
+        for (int x = 0; x < VDG_ACTIVE_WIDTH; x += 2) {
+            uint8_t pair = packed[x >> 1];
+            unpacked[x]     = pair & 0x0F;
+            unpacked[x + 1] = pair >> 4;
+        }
+        hal_video_render_scanline(line, unpacked, VDG_ACTIVE_WIDTH);
+    }
+    return true;
+}
+
+// Phase 2: pushSprite — no snapshot access; safe to run while Core 0 is
+// already writing the next frame's snapshot.
+void hal_video_push_sprite_only(void) {
+    if (!display_available || !sprite) return;
+    if (hal_keyboard_osk_visible()) return;
+    sprite->pushSprite(SPR_X, SPR_Y);
+    if (fps_overlay_enabled) {
+        fps_overlay_draw();
+    }
+    hal_keyboard_draw_overlay();
+}
+
+// Legacy single-call variant (used by single-core fallback path).
+void hal_video_present_snapshot(const struct render_snapshot* snap) {
+    if (hal_video_snapshot_fill_sprite(snap)) {
+        hal_video_push_sprite_only();
+    }
+}
+
 // Expose TFT instance for supervisor OSD rendering
 TFT_eSPI* hal_video_get_tft(void) {
     return display_available ? &tft : nullptr;

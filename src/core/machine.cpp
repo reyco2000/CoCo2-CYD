@@ -49,6 +49,85 @@
 // Global machine pointer for CPU memory callbacks
 static Machine* g_machine = nullptr;
 
+// --- Dual-core render handshake (Core 0 producer / Core 1 consumer) -------
+// Heap-allocated to keep it out of the static DRAM segment (the pixel buffer
+// alone is 48 KB).
+static render_snapshot_t* s_render_snap = nullptr;
+static SemaphoreHandle_t s_sem_frame_ready = nullptr;
+static SemaphoreHandle_t s_sem_render_done = nullptr;
+static volatile bool     s_emu_enabled     = true;
+
+// When true, machine_run_scanline routes mc6847 line_buffer into the snapshot
+// instead of writing pixels directly into the sprite framebuffer. Set inside
+// machine_run_frame_cpu_only so the Core-0 CPU task never touches the sprite
+// that Core 1 may be reading during pushSprite.
+static bool s_capturing_to_snapshot = false;
+
+// VRAM byte count per VDG graphics mode (GM bits) — duplicated from
+// hal_video.cpp so the CPU side can size its VRAM snapshot copy.
+static inline uint16_t vram_snapshot_size_for_gm(uint8_t gm) {
+    static const uint16_t sizes[8] = { 1024, 1024, 2048, 1536, 3072, 3072, 6144, 6144 };
+    return sizes[gm & 0x07];
+}
+
+void machine_init_render_handshake(void) {
+    DEBUG_PRINTF("Render handshake: free=%d, largest=%d, 8BIT=%d INTERNAL=%d",
+        ESP.getFreeHeap(),
+        ESP.getMaxAllocHeap(),
+        (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    if (!s_render_snap) {
+        s_render_snap = (render_snapshot_t*)calloc(1, sizeof(render_snapshot_t));
+        if (!s_render_snap) {
+            DEBUG_PRINT("Machine: snapshot struct alloc failed");
+            return;
+        }
+
+        bool ok = true;
+        for (int i = 0; i < SNAPSHOT_PIXEL_CHUNKS; i++) {
+            s_render_snap->pixel_chunks[i] = (uint8_t*)calloc(1, SNAPSHOT_CHUNK_BYTES);
+            if (!s_render_snap->pixel_chunks[i]) {
+                DEBUG_PRINTF("Machine: snapshot pixel_chunks[%d] alloc failed (free=%d)",
+                    i, ESP.getFreeHeap());
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            for (int i = 0; i < SNAPSHOT_VRAM_CHUNKS; i++) {
+                s_render_snap->vram_chunks[i] = (uint8_t*)calloc(1, SNAPSHOT_VRAM_CHUNK);
+                if (!s_render_snap->vram_chunks[i]) {
+                    DEBUG_PRINTF("Machine: snapshot vram_chunks[%d] alloc failed (free=%d)",
+                        i, ESP.getFreeHeap());
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!ok) {
+            for (int i = 0; i < SNAPSHOT_PIXEL_CHUNKS; i++) free(s_render_snap->pixel_chunks[i]);
+            for (int i = 0; i < SNAPSHOT_VRAM_CHUNKS; i++) free(s_render_snap->vram_chunks[i]);
+            free(s_render_snap);
+            s_render_snap = nullptr;
+            return;
+        }
+        DEBUG_PRINTF("Machine: snapshot allocated, free=%d", ESP.getFreeHeap());
+    }
+    if (!s_sem_frame_ready) s_sem_frame_ready = xSemaphoreCreateBinary();
+    if (!s_sem_render_done) s_sem_render_done = xSemaphoreCreateBinary();
+    // Prime render_done so the producer is free to fill the first frame.
+    xSemaphoreGive(s_sem_render_done);
+}
+
+const render_snapshot_t* machine_get_render_snapshot(void) { return s_render_snap; }
+SemaphoreHandle_t machine_get_frame_ready_sem(void)        { return s_sem_frame_ready; }
+SemaphoreHandle_t machine_get_render_done_sem(void)        { return s_sem_render_done; }
+
+void machine_emulation_set_enabled(bool en) { s_emu_enabled = en; }
+bool machine_emulation_is_enabled(void)     { return s_emu_enabled; }
+
 // Update VDG mode from PIA1 (AG, CSS) + SAM (GM0-GM2)
 static void update_vdg_mode(Machine* m) {
     uint8_t pb = m->pia1.data_b & m->pia1.ddr_b;
@@ -567,7 +646,18 @@ void machine_run_scanline(Machine* m) {
         m->vdg.row_address = sam6883_get_vdg_row_address(&m->sam);
         m->vdg.scanline = m->scanline;
         if (mc6847_render_scanline(&m->vdg)) {
-            hal_video_render_scanline(m->scanline, m->vdg.line_buffer, VDG_ACTIVE_WIDTH);
+            if (s_capturing_to_snapshot && s_render_snap) {
+                // Core-0 CPU task: pack two 4-bit palette indices per byte
+                // into the snapshot; Core 1 unpacks + converts to RGB565.
+                const uint8_t* src = m->vdg.line_buffer;
+                uint8_t* dst = snapshot_row_ptr(s_render_snap, m->scanline);
+                for (int x = 0; x < VDG_ACTIVE_WIDTH; x += 2) {
+                    dst[x >> 1] = (uint8_t)((src[x] & 0x0F) | ((src[x + 1] & 0x0F) << 4));
+                }
+                s_render_snap->line_valid[m->scanline] = 1;
+            } else {
+                hal_video_render_scanline(m->scanline, m->vdg.line_buffer, VDG_ACTIVE_WIDTH);
+            }
         }
 
         // Simulate VDG data fetch: advance SAM counter by bytes_per_row.
@@ -600,9 +690,11 @@ void machine_run_scanline(Machine* m) {
 // Public API: run one frame (262 scanlines)
 // ============================================================
 
-void machine_run_frame(Machine* m) {
-    if (!m->initialized) return;
-
+// Internal: run 262 scanlines + audio capture/commit. Shared by both the
+// legacy machine_run_frame (sprite-direct render path) and the dual-core
+// machine_run_frame_cpu_only (snapshot-capture path). The caller sets
+// s_capturing_to_snapshot to choose which path machine_run_scanline takes.
+static void machine_run_frame_body(Machine* m) {
     // Precompute cycle targets for all 262 scanlines
     for (int i = 0; i < SCANLINES_PER_FRAME; i++) {
         scanline_cycle_targets[i] = ((i + 1) * m->cycles_per_frame) / SCANLINES_PER_FRAME;
@@ -619,10 +711,64 @@ void machine_run_frame(Machine* m) {
 
     // Commit scanline audio buffer to ISR for playback at correct CoCo rate
     hal_audio_commit_frame();
+}
+
+void machine_run_frame(Machine* m) {
+    if (!m->initialized) return;
+
+    s_capturing_to_snapshot = false;  // legacy path writes pixels straight to sprite
+    machine_run_frame_body(m);
 
     // Present completed frame (with VRAM shadow compare — OPT-16)
     hal_video_present(m->ram, m->sam.vdg_base, m->vdg.mode);
 
+    m->frame_count++;
+}
+
+void machine_run_frame_cpu_only(Machine* m) {
+    if (!m->initialized) return;
+    if (!s_sem_frame_ready || !s_sem_render_done || !s_render_snap) {
+        // Handshake not initialized: fall back to synchronous frame.
+        machine_run_frame(m);
+        return;
+    }
+
+    // Wait for the renderer to finish the previous frame before overwriting
+    // the snapshot. On the first call, render_done was primed by
+    // machine_init_render_handshake so this returns immediately.
+    xSemaphoreTake(s_sem_render_done, portMAX_DELAY);
+
+    // Reset per-frame validity bits; mc6847 will set them as it renders.
+    memset(s_render_snap->line_valid, 0, sizeof(s_render_snap->line_valid));
+
+    s_capturing_to_snapshot = true;
+    machine_run_frame_body(m);
+    s_capturing_to_snapshot = false;
+
+    // Capture VRAM region + VDG mode/base for the OPT-16 shadow compare.
+    const uint16_t vsize = (m->vdg.mode & VDG_AG)
+        ? vram_snapshot_size_for_gm(m->vdg.mode & 0x07)
+        : 512;  // VRAM_TEXT_SIZE
+    if (m->ram) {
+        // Split the captured VRAM region into the two 3 KB chunks so the
+        // Core-1 renderer can memcmp it against its 6 KB private shadow.
+        const uint8_t* src = m->ram + m->sam.vdg_base;
+        uint16_t off = 0;
+        for (int i = 0; i < SNAPSHOT_VRAM_CHUNKS && off < vsize; i++) {
+            uint16_t copy = (uint16_t)((vsize - off > SNAPSHOT_VRAM_CHUNK)
+                ? SNAPSHOT_VRAM_CHUNK : (vsize - off));
+            memcpy(s_render_snap->vram_chunks[i], src + off, copy);
+            off = (uint16_t)(off + copy);
+        }
+    }
+    s_render_snap->vdg_base  = m->sam.vdg_base;
+    s_render_snap->vdg_mode  = m->vdg.mode;
+    s_render_snap->vram_size = vsize;
+    s_render_snap->frame_id  = m->frame_count;
+
+    // Hand the snapshot to the Core-1 renderer. While it does the SPI push,
+    // the next call will run CPU+VDG into a fresh snapshot.
+    xSemaphoreGive(s_sem_frame_ready);
     m->frame_count++;
 }
 

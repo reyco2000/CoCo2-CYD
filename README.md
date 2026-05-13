@@ -291,15 +291,52 @@ CoCo2-CYD.ino  — setup() + loop()
            sv_render.cpp    — Blue-theme OSD renderer
 ```
 
+### Dual-core split
+
+CPU emulation runs on **Core 0** while the display SPI push runs on **Core 1** in
+parallel. The CPU task captures a per-frame render snapshot (palette indices +
+VRAM region) and hands it off via two binary semaphores (`frame_ready` /
+`render_done`). The renderer releases `render_done` as soon as it has filled
+the sprite buffer from the snapshot — *before* the slow `pushSprite` — so the
+next frame's CPU work overlaps with the SPI transfer.
+
+```
+Core 0 (cpu_emu task, priority 2)        Core 1 (Arduino loopTask)
+───────────────────────────────────      ──────────────────────────────────
+take render_done                         hal_process_input()
+machine_run_frame_cpu_only(coco)         supervisor_update_and_render()
+  ├─ 262 × machine_run_scanline          take frame_ready ─┐
+  │   └─ pack 4 bpp indices into        │                  │
+  │      pixel snapshot chunks          │  fill sprite     │ (CPU runs
+  ├─ audio capture/commit               │  from snapshot   │  next frame
+  └─ memcpy VRAM → snapshot chunks      │   (3 ms)         │  in parallel)
+give frame_ready ───────────────────────►give render_done ─┘
+vTaskDelay(1)                            pushSprite (~20 ms over SPI)
+                                         hal_keyboard_draw_overlay()
+```
+
+Performance: text mode ~70 FPS (renderer skips most pushes via shadow
+compare), graphics mode ~34 FPS (was ~25 FPS before the split).
+
 ### Main loop order
 
 ```
-loop():
+Core 1 loop():
   1. hal_process_input()             — XPT2046 touch + deferred key releases
   2. supervisor_update_and_render()  — OSD (skips emulation while active)
-  3. machine_run_frame()             — 262 scanlines: CPU + VDG + SAM + FDC
-  4. hal_render_frame()              — VRAM shadow compare → SPI push if changed
-  5. hal_keyboard_draw_overlay()     — OSK hotzone indicator on TFT border
+  3. take frame_ready                — wait for snapshot from Core 0
+  4. hal_video_snapshot_fill_sprite()— shadow compare + 4 bpp unpack into sprite
+  5. give render_done                — Core 0 may now overwrite snapshot
+  6. hal_video_push_sprite_only()    — pushSprite over SPI (slow; CPU runs in parallel)
+  7. hal_keyboard_draw_overlay()     — OSK hotzone indicator on TFT border
+
+Core 0 cpu_emu task:
+  1. take render_done                — block until renderer freed the snapshot
+  2. machine_run_frame_cpu_only()    — 262 scanlines: CPU + VDG + SAM + FDC + audio
+                                       (writes palette indices into snapshot
+                                        instead of the sprite framebuffer)
+  3. give frame_ready                — hand snapshot to Core 1
+  4. vTaskDelay(1)                   — feed IDLE0 / task watchdog
 ```
 
 ---
@@ -323,14 +360,15 @@ CoCo2-CYD/
   config.h              Hardware config, pins, timing
 
   src/core/
-    machine.cpp/.h      System integration, memory map, frame loop
+    machine.cpp/.h      System integration, memory map, frame loop, Core-0 handshake
+    render_snapshot.h   Dual-core snapshot struct (4 bpp pixel chunks + VRAM chunks)
     mc6809.cpp/.h       MC6809 CPU (all opcodes, cycle-accurate)
     mc6821.cpp/.h       MC6821 PIA (2 instances)
     mc6847.cpp/.h       MC6847 VDG (text + 8 graphics modes)
     sam6883.cpp/.h      SAM6883 (address mux + VDG counter)
 
   src/hal/
-    hal_video.cpp       TFT_eSPI display, sprite, VRAM shadow compare
+    hal_video.cpp       TFT_eSPI display, sprite, VRAM shadow compare, snapshot fill/push
     hal_audio.cpp       ESP32 DAC audio, scanline buffer, ISR
     hal_keyboard.cpp    CoCo matrix mapping, XPT2046 touch, deferred release
     CoCo2Keyboard.h     On-screen keyboard layout + touch dispatch

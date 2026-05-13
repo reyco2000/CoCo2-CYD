@@ -28,6 +28,24 @@
 
 Machine coco;
 
+// Pinned CPU emulation task running on Core 0. Produces a render snapshot
+// each frame; the Arduino loop (Core 1) consumes it via the frame_ready /
+// render_done semaphores in machine.cpp.
+static TaskHandle_t s_cpu_task_handle = nullptr;
+
+static void cpu_task(void* /*arg*/) {
+    for (;;) {
+        if (!machine_emulation_is_enabled()) {
+            // Supervisor (OSD) active — pause emulation, frame-aligned.
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        machine_run_frame_cpu_only(&coco);
+        // Yield so FreeRTOS IDLE0 runs and the task watchdog stays happy.
+        vTaskDelay(1);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -102,6 +120,27 @@ void setup() {
     DEBUG_PRINT("Keyboard: no USB host on CYD (Phase 2: touch/BT/PS2)");
 #endif
 
+    // Allocate the dual-core render snapshot now (small enough to fit in the
+    // post-init heap; placed last so SD/sprite/RAM init order is unchanged
+    // from the working single-core layout). Pin the emulation task to Core 0
+    // so SPI display pushes on Core 1 run in parallel — but only if the
+    // snapshot was allocated. On low-memory failure the loop() falls back to
+    // synchronous emulation.
+    machine_init_render_handshake();
+    DEBUG_PRINTF("Render snapshot: %s (heap free %d)",
+        machine_get_render_snapshot() ? "OK" : "FAILED",
+        ESP.getFreeHeap());
+
+    if (machine_get_render_snapshot()) {
+        xTaskCreatePinnedToCore(
+            cpu_task, "cpu_emu", 8192, nullptr,
+            2 /* priority above default */, &s_cpu_task_handle,
+            0 /* core 0 */);
+        DEBUG_PRINT("CPU emulation task pinned to Core 0");
+    } else {
+        DEBUG_PRINT("CPU task not started — falling back to single-core path");
+    }
+
     DEBUG_PRINT("Entering main loop...");
 
 #ifdef RUN_INTEGRATION_TESTS
@@ -131,17 +170,38 @@ void loop() {
 
     // Check if supervisor is handling this frame
     if (supervisor_update_and_render()) {
-        // Supervisor is active — emulation paused
+        // Supervisor is active — emulation paused (CPU task self-throttles
+        // when machine_emulation_is_enabled() returns false).
         yield();
         return;
     }
 
-    // Run one video frame worth of emulation
-    machine_run_frame(&coco);
-
-    // Push framebuffer to display (suppressed while OSK covers the screen)
-    if (!hal_keyboard_osk_visible()) {
-        hal_render_frame();
+    if (s_cpu_task_handle) {
+        // Dual-core: consume one render snapshot from the Core-0 CPU task.
+        // We release the snapshot (give render_done) as soon as we've copied
+        // it into the sprite, BEFORE the slow pushSprite. That way Core 0
+        // runs the next frame's CPU+VDG in parallel with our SPI push.
+        SemaphoreHandle_t frame_ready = machine_get_frame_ready_sem();
+        SemaphoreHandle_t render_done = machine_get_render_done_sem();
+        if (frame_ready && xSemaphoreTake(frame_ready, pdMS_TO_TICKS(20)) == pdTRUE) {
+            const render_snapshot_t* snap = machine_get_render_snapshot();
+            bool need_push = false;
+            if (snap && !hal_keyboard_osk_visible()) {
+                need_push = hal_video_snapshot_fill_sprite(snap);
+            }
+            // Snapshot is now in the sprite buffer; let Core 0 reuse it.
+            if (render_done) xSemaphoreGive(render_done);
+            if (need_push) {
+                hal_video_push_sprite_only();
+            }
+        }
+    } else {
+        // Single-core fallback (snapshot alloc failed): run CPU + present
+        // synchronously on Core 1 as the project did originally.
+        machine_run_frame(&coco);
+        if (!hal_keyboard_osk_visible()) {
+            hal_render_frame();
+        }
     }
     hal_keyboard_draw_overlay();  // hotzone always visible after emulation frames
 

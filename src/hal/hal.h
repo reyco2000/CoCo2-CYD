@@ -62,6 +62,22 @@ void hal_video_render_scanline(int line, const uint8_t* pixels, int width);
 //   vdg_mode: VDG mode byte (AG|GM|CSS bits)
 void hal_video_present(const uint8_t* ram, uint16_t vdg_base, uint8_t vdg_mode);
 
+// Dual-core renderer: walk a pre-captured palette-index pixel snapshot,
+// convert to RGB565 in the sprite, run the OPT-16 VRAM shadow compare, then
+// pushSprite. Called from the Core-1 loop after taking frame_ready.
+struct render_snapshot;
+void hal_video_present_snapshot(const struct render_snapshot* snap);
+
+// Split-phase variant so the Core-1 loop can release the snapshot to the
+// CPU task as soon as the sprite is filled (a few ms) and then do the slow
+// pushSprite (~20 ms) in parallel with Core 0's next frame.
+//
+//   hal_video_snapshot_fill_sprite()  reads snap, runs shadow compare,
+//       fills the sprite (or returns false if the frame can be skipped).
+//   hal_video_push_sprite_only()      pushSprite — no snapshot needed.
+bool hal_video_snapshot_fill_sprite(const struct render_snapshot* snap);
+void hal_video_push_sprite_only(void);
+
 // ============================================================
 // Audio subsystem
 // ============================================================
