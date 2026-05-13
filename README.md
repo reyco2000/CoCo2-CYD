@@ -417,5 +417,5 @@ This project is derived from [XRoar](https://www.6809.org.uk/xroar/) by Ciaran A
 Current ESP32 CYD port by Reinaldo Torres / CoCoByte Club —
 <https://github.com/reyco2000/CoCo2-CYD>
 ## Contact
-Reinaldo Torres — reinaldo@example.com  
+Reinaldo Torres — chipshift@cocobyte.co  
 GitHub: [@reyco2000](https://github.com/reyco2000)
